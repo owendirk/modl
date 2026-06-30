@@ -39,6 +39,7 @@ use tokio_tungstenite::{
     tungstenite::{
         Error as WsError, Message,
         client::IntoClientRequest,
+        error::ProtocolError,
         http::{HeaderValue, header::USER_AGENT},
         protocol::CloseFrame,
     },
@@ -60,6 +61,7 @@ const DEFAULT_EXTENDED_SPOT_MARKET: &str = "BTCSPOT-USD";
 const DEFAULT_HIBACHI_SYMBOL: &str = "BTC/USDT-P";
 const DEFAULT_DERIBIT_TRADES_INTERVAL: &str = "100ms";
 const DERIBIT_SUBSCRIBE_CHUNK_SIZE: usize = 200;
+const DERIBIT_SUBSCRIBE_CHUNK_DELAY: Duration = Duration::from_millis(250);
 const DEFAULT_DERIBIT_WS_URL: &str = "wss://www.deribit.com/ws/api/v2";
 const DEFAULT_HIBACHI_MARKET_WS_URL: &str = concat!(
     "wss://data-api.hibachi.xyz/ws/market?hibachiClient=",
@@ -754,8 +756,10 @@ async fn run_static_feed_once(
             NextWebsocketEvent::Shutdown => break FeedRunStatus::Complete,
             NextWebsocketEvent::Closed => break FeedRunStatus::Reconnect,
             NextWebsocketEvent::Message(message) => {
-                let message =
-                    message.with_context(|| format!("failed reading {}", spec.connection_id))?;
+                let Some(message) = websocket_message_or_reconnect(message, &spec.connection_id)?
+                else {
+                    break FeedRunStatus::Reconnect;
+                };
                 let message_status = handle_websocket_message(
                     message,
                     spec,
@@ -863,8 +867,10 @@ async fn run_deribit_feed_once(
             NextWebsocketEvent::Shutdown => break FeedRunStatus::Complete,
             NextWebsocketEvent::Closed => break FeedRunStatus::Reconnect,
             NextWebsocketEvent::Message(message) => {
-                let message =
-                    message.with_context(|| format!("failed reading {}", spec.connection_id))?;
+                let Some(message) = websocket_message_or_reconnect(message, &spec.connection_id)?
+                else {
+                    break FeedRunStatus::Reconnect;
+                };
                 let mut context = DeribitMessageContext {
                     spec,
                     args,
@@ -945,7 +951,8 @@ where
     }
 
     let count = channels.len();
-    for channel_chunk in channels.chunks(DERIBIT_SUBSCRIBE_CHUNK_SIZE) {
+    let chunk_count = channels.chunks(DERIBIT_SUBSCRIBE_CHUNK_SIZE).len();
+    for (index, channel_chunk) in channels.chunks(DERIBIT_SUBSCRIBE_CHUNK_SIZE).enumerate() {
         let id = runtime_state.next_deribit_request_id();
         let text = serde_json::json!({
             "jsonrpc": "2.0",
@@ -961,8 +968,18 @@ where
             .send(Message::Text(text.into()))
             .await
             .with_context(|| format!("failed to send Deribit subscription on {connection_id}"))?;
+        socket_write
+            .flush()
+            .await
+            .with_context(|| format!("failed to flush Deribit subscription on {connection_id}"))?;
+
+        if index + 1 < chunk_count {
+            sleep(DERIBIT_SUBSCRIBE_CHUNK_DELAY).await;
+        }
     }
-    eprintln!("{connection_id} subscribed to {count} Deribit channel(s)");
+    eprintln!(
+        "{connection_id} subscribed to {count} Deribit channel(s) in {chunk_count} request(s)"
+    );
     Ok(())
 }
 
@@ -1210,6 +1227,34 @@ fn websocket_message_event(message: Option<Result<Message, WsError>>) -> NextWeb
     match message {
         Some(message) => NextWebsocketEvent::Message(message),
         None => NextWebsocketEvent::Closed,
+    }
+}
+
+fn websocket_message_or_reconnect(
+    message: Result<Message, WsError>,
+    connection_id: &str,
+) -> Result<Option<Message>> {
+    match message {
+        Ok(message) => Ok(Some(message)),
+        Err(error) if is_expected_websocket_reconnect_error(&error) => {
+            eprintln!("{connection_id} websocket connection reset; reconnecting");
+            Ok(None)
+        }
+        Err(error) => Err(error).with_context(|| format!("failed reading {connection_id}")),
+    }
+}
+
+fn is_expected_websocket_reconnect_error(error: &WsError) -> bool {
+    match error {
+        WsError::ConnectionClosed
+        | WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => true,
+        WsError::Io(error) => matches!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::UnexpectedEof
+        ),
+        _ => false,
     }
 }
 
@@ -4092,6 +4137,19 @@ mod tests {
             }
         });
         assert_eq!(deribit_heartbeat_type(&subscription), None);
+    }
+
+    #[test]
+    fn treats_websocket_reset_without_close_as_reconnect() {
+        assert!(is_expected_websocket_reconnect_error(&WsError::Protocol(
+            ProtocolError::ResetWithoutClosingHandshake
+        )));
+        assert!(is_expected_websocket_reconnect_error(&WsError::Io(
+            std::io::Error::from(std::io::ErrorKind::ConnectionReset)
+        )));
+        assert!(!is_expected_websocket_reconnect_error(&WsError::Protocol(
+            ProtocolError::MaskedFrameFromServer
+        )));
     }
 
     #[test]
