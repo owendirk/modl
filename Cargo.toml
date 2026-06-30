@@ -1,0 +1,32 @@
+[package]
+name = "modl"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+default-run = "modl"
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[dependencies]
+anyhow = "1.0.100"
+arrow-array = "59.0.0"
+arrow-schema = "59.0.0"
+base64 = "0.22.1"
+chrono = "0.4.45"
+clap = { version = "4.6.1", features = ["derive", "env"] }
+futures-util = "0.3.32"
+hypersdk = "0.2.14"
+parquet = { version = "59.0.0", default-features = false, features = ["arrow", "zstd"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
+rustls = { version = "0.23.40", default-features = false, features = ["ring"] }
+rust_decimal = "1.42.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-webpki-roots"] }
+zstd = "0.13.3"

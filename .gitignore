@@ -1,0 +1,7 @@
+/target
+notebooks/.ipynb_checkpoints/
+*.ndjson
+*.jsonl
+*.jsonl.zst
+*.csv
+*.parquet
