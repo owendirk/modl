@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -13,6 +14,24 @@ from scipy.stats import norm, skewnorm
 
 MINUTES_PER_YEAR = 365 * 24 * 60
 DEFAULT_BAR_MINUTES = 5
+FEATURE_DATASET_KEYS = frozenset(
+    [
+        "bitfinex/tbtcusd/book_l25",
+        "bitfinex/tbtcusd/trades",
+        "deribit/btc/incremental_ticker",
+        "deribit/btc/instrument_state",
+        "deribit/btc/instruments",
+        "deribit/btc/trades",
+        "hibachi/btc_usdt-p/funding",
+        "hibachi/btc_usdt-p/orderbook",
+        "hibachi/btc_usdt-p/prices",
+        "hibachi/btc_usdt-p/quotes",
+        "hibachi/btc_usdt-p/trades",
+        "hyperliquid/ubtc_usdc/book",
+        "hyperliquid/ubtc_usdc/control",
+        "hyperliquid/ubtc_usdc/trades",
+    ]
+)
 
 
 @dataclass(frozen=True)
@@ -102,6 +121,37 @@ def discover_datasets(root: Path, date_tag: str) -> dict[str, str]:
         exchange, symbol, dataset = rel.parts[:3]
         datasets[f"{exchange}/{symbol}/{dataset}"] = str(path)
     return datasets
+
+
+def available_dataset_dates(root: Path) -> dict[str, set[str]]:
+    dates: dict[str, set[str]] = {}
+    for path in sorted(root.rglob("*.parquet")):
+        rel = path.relative_to(root)
+        if len(rel.parts) < 4:
+            continue
+        stem = path.stem
+        try:
+            date_tag = stem.rsplit("_", 1)[1]
+            date = datetime.strptime(date_tag, "%y-%m-%d").strftime("%Y-%m-%d")
+        except (IndexError, ValueError):
+            continue
+        exchange, symbol, dataset = rel.parts[:3]
+        dates.setdefault(date, set()).add(f"{exchange}/{symbol}/{dataset}")
+    return dates
+
+
+def latest_dataset_date(root: Path, required_keys: set[str] | frozenset[str] | None = None) -> str:
+    dates = available_dataset_dates(root)
+    if not dates:
+        raise FileNotFoundError(f"No normalized Parquet files found under {root}")
+    for date in sorted(dates, reverse=True):
+        if required_keys is None or set(required_keys).issubset(dates[date]):
+            return date
+    raise FileNotFoundError(f"No normalized Parquet date under {root} has the required dataset set")
+
+
+def latest_feature_date(root: Path) -> str:
+    return latest_dataset_date(root, FEATURE_DATASET_KEYS)
 
 
 def empty_frame(columns: list[str]) -> pl.DataFrame:
