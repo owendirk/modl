@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
 from sklearn.covariance import LedoitWolf
+
+
+X18_FLOAT = 1_000_000_000_000_000_000.0
 
 
 @dataclass(frozen=True)
@@ -20,6 +25,152 @@ def first_available(frame: pd.DataFrame, columns: list[str], min_obs: int = 3) -
         if column in frame and frame[column].notna().sum() >= min_obs:
             return frame[column].astype(float)
     return None
+
+
+def _empty_account_frames() -> dict[str, pd.DataFrame]:
+    return {
+        "updates": pd.DataFrame(),
+        "positions": pd.DataFrame(),
+        "fills": pd.DataFrame(),
+        "open_orders": pd.DataFrame(),
+        "order_gone": pd.DataFrame(),
+        "equity": pd.DataFrame(),
+        "freshness": pd.DataFrame(),
+    }
+
+
+def load_churnado_account_journal(path: str | Path) -> dict[str, pd.DataFrame]:
+    path = Path(path).expanduser()
+    if not path.exists() or path.stat().st_size == 0:
+        return _empty_account_frames()
+
+    records = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    if not records:
+        return _empty_account_frames()
+
+    updates = pd.DataFrame(records)
+    if "recorded_unix_millis" in updates:
+        updates["recorded_at"] = pd.to_datetime(updates["recorded_unix_millis"], unit="ms", utc=True)
+    for source, target in [
+        ("qty_x18", "qty"),
+        ("price_x18", "price"),
+        ("equity_x18", "equity"),
+    ]:
+        if source in updates:
+            updates[target] = pd.to_numeric(updates[source], errors="coerce") / X18_FLOAT
+
+    frames = _empty_account_frames()
+    frames["updates"] = updates
+    for kind, key in [
+        ("position", "positions"),
+        ("fill", "fills"),
+        ("open_order", "open_orders"),
+        ("order_gone", "order_gone"),
+        ("equity", "equity"),
+        ("freshness", "freshness"),
+    ]:
+        frames[key] = updates.loc[updates["type"].eq(kind)].copy() if "type" in updates else pd.DataFrame()
+    return frames
+
+
+def load_churnado_market_catalog(
+    catalog_dir: str | Path,
+    environment: str = "mainnet",
+) -> pd.DataFrame:
+    path = Path(catalog_dir).expanduser() / f"matched_perps.{environment}.json"
+    if not path.exists():
+        return pd.DataFrame(columns=["symbol", "venue", "venue_id", "instrument_id", "raw_symbol"])
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    rows = []
+    for match in payload.get("matches", []):
+        symbol = match.get("symbol")
+        for venue_key in ["rise", "nado"]:
+            venue = match.get(venue_key) or {}
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "venue": venue.get("venue", venue_key),
+                    "venue_id": venue.get("venue_id"),
+                    "instrument_id": venue.get("instrument_id"),
+                    "raw_symbol": venue.get("raw_symbol"),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def attach_churnado_symbols(frame: pd.DataFrame, catalog: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty or catalog.empty or not {"venue_id", "instrument_id"}.issubset(frame.columns):
+        return frame.copy()
+    return frame.merge(
+        catalog[["venue_id", "instrument_id", "symbol", "raw_symbol"]],
+        on=["venue_id", "instrument_id"],
+        how="left",
+    )
+
+
+def default_churnado_hedge_instrument(symbol: str | float | None, columns: list[str]) -> str | None:
+    symbol_text = "" if pd.isna(symbol) else str(symbol).upper()
+    if "BTC" not in symbol_text:
+        return None
+    for candidate in ["hibachi_perp", "deribit_perp_proxy", "hyperliquid_ubtc", "bitfinex_spot"]:
+        if candidate in columns:
+            return candidate
+    return columns[0] if columns else None
+
+
+def latest_churnado_inventory(
+    positions: pd.DataFrame,
+    columns: list[str],
+    instrument_map: dict[str, str] | None = None,
+    catalog: pd.DataFrame | None = None,
+) -> tuple[pd.Series, pd.DataFrame]:
+    inventory = pd.Series(0.0, index=columns, name="live_inventory_btc")
+    if positions.empty:
+        return inventory, pd.DataFrame()
+
+    enriched = attach_churnado_symbols(positions, catalog if catalog is not None else pd.DataFrame())
+    if not {"venue_id", "instrument_id"}.issubset(enriched.columns):
+        return inventory, enriched.copy()
+    sort_cols = [col for col in ["venue_id", "instrument_id", "recorded_unix_millis"] if col in enriched]
+    if sort_cols:
+        enriched = enriched.sort_values(sort_cols)
+    latest = (
+        enriched.dropna(subset=["venue_id", "instrument_id"])
+        .drop_duplicates(["venue_id", "instrument_id"], keep="last")
+        .copy()
+    )
+    if "qty" not in latest:
+        latest["qty"] = pd.to_numeric(latest.get("qty_x18"), errors="coerce") / X18_FLOAT
+
+    instrument_map = instrument_map or {}
+    mapped = []
+    for _, row in latest.iterrows():
+        keys = [
+            f"{row.get('venue')}:{int(row['instrument_id'])}" if pd.notna(row.get("venue")) else None,
+            f"{int(row['venue_id'])}:{int(row['instrument_id'])}",
+            str(row.get("symbol")) if pd.notna(row.get("symbol")) else None,
+        ]
+        hedge_instrument = next((instrument_map[key] for key in keys if key in instrument_map), None)
+        if hedge_instrument is None:
+            hedge_instrument = default_churnado_hedge_instrument(row.get("symbol"), columns)
+        qty = float(row.get("qty", 0.0) or 0.0)
+        if hedge_instrument in inventory.index:
+            inventory.loc[hedge_instrument] += qty
+        mapped.append({**row.to_dict(), "hedge_instrument": hedge_instrument, "mapped_qty_btc": qty})
+
+    detail = pd.DataFrame(mapped)
+    return inventory, detail
 
 
 def build_hedge_universe(
