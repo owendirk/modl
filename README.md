@@ -222,7 +222,7 @@ Deribit `instruments` is keyed by `instrument_name`. Deribit `incremental_ticker
 
 ## Paper Trading Recorder
 
-The paper trading recorder notebook builds an append-only JSONL event log for the current quote-policy candidate. It records decision, replay projection, market snapshot, submit, ack, cancel, cancel ack, and fill events with a hash chain so paper/live behavior can be compared against the historical replay model.
+The paper trading recorder notebook builds an append-only JSONL event log for the current quote-policy candidate. It records decision, replay projection, market snapshot, submit, ack, cancel, cancel ack, and fill events with a hash chain so paper/live behavior can be compared against the historical replay model. The paper trading runtime notebook consumes public trades through a paper order manager, applies queue-ahead, and compares independent replay-style orders with realistic quote replacement.
 
 Run it with the burner notebook environment:
 
@@ -231,11 +231,13 @@ MPLBACKEND=Agg PYTHONDONTWRITEBYTECODE=1 \
   /home/skier/Documents/burner/btc-vol-strategy/.venv/bin/python
 ```
 
-Open `notebooks/paper_trading_recorder.ipynb` in Jupyter for the interactive version. By default the dry-run JSONL is written under `/tmp/modl_paper_trading_recorder`. For persistent paper logs, set:
+Open `notebooks/paper_trading_recorder.ipynb` or `notebooks/paper_trading_runtime.ipynb` in Jupyter for the interactive versions. By default dry-run JSONL is written under `/tmp/modl_paper_trading_recorder` and runtime JSONL under `/tmp/modl_paper_trading_runtime`. For persistent paper logs, set:
 
 ```sh
 export MODL_PAPER_OUTPUT_ROOT=/mnt/burner-archive/paper_trading
+export MODL_PAPER_RUNTIME_OUTPUT_ROOT=/mnt/burner-archive/paper_trading_runtime
 export MODL_PAPER_RUN_ID=paper-$(date -u +%Y%m%dT%H%M%SZ)
+export MODL_PAPER_RUNTIME_RUN_ID=runtime-$(date -u +%Y%m%dT%H%M%SZ)
 ```
 
 ## Rate Limit Behavior

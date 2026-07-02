@@ -230,15 +230,24 @@ def lifecycle_summary(events: pd.DataFrame) -> pd.DataFrame:
     order_events = events.dropna(subset=["paper_order_id"]).sort_values(["paper_order_id", "event_mts"])
     for paper_order_id, group in order_events.groupby("paper_order_id", sort=False):
         first_by_type = group.groupby("event_type")["event_mts"].min()
-        filled_qty = pd.to_numeric(group.loc[group["event_type"].eq("order_fill"), "fill_qty"], errors="coerce").sum()
+        if "fill_qty" in group.columns:
+            fill_qty = group.loc[group["event_type"].eq("order_fill"), "fill_qty"]
+        else:
+            fill_qty = pd.Series(dtype=float)
+        filled_qty = pd.to_numeric(fill_qty, errors="coerce").sum()
         remaining_qty = pd.to_numeric(group.get("remaining_qty", pd.Series(dtype=float)), errors="coerce").dropna()
+        last_remaining = float(remaining_qty.iloc[-1]) if len(remaining_qty) else np.nan
         status = "open"
         if "order_reject" in first_by_type:
             status = "rejected"
-        elif "order_fill" in first_by_type and filled_qty > 0:
+        elif "order_fill" in first_by_type and filled_qty > 0 and (not np.isfinite(last_remaining) or last_remaining <= 0.0):
             status = "filled"
+        elif "order_cancel_ack" in first_by_type and filled_qty > 0:
+            status = "partial_cancelled"
         elif "order_cancel_ack" in first_by_type:
             status = "cancelled"
+        elif "order_fill" in first_by_type and filled_qty > 0:
+            status = "partial_open"
 
         row = {
             "paper_order_id": paper_order_id,
@@ -251,7 +260,7 @@ def lifecycle_summary(events: pd.DataFrame) -> pd.DataFrame:
             "cancel_request_mts": first_by_type.get("order_cancel_request", np.nan),
             "cancel_ack_mts": first_by_type.get("order_cancel_ack", np.nan),
             "filled_qty": float(filled_qty),
-            "last_remaining_qty": float(remaining_qty.iloc[-1]) if len(remaining_qty) else np.nan,
+            "last_remaining_qty": last_remaining,
         }
         row["decision_to_submit_ms"] = row["submit_mts"] - row["decision_mts"]
         row["submit_to_ack_ms"] = row["ack_mts"] - row["submit_mts"]
