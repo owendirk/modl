@@ -175,7 +175,7 @@ Each line is a capture envelope with `received_at`, `received_mts`, `exchange`, 
 
 ## Normalizing Raw Websocket Files
 
-Use the separate `modl-normalize` binary after a UTC day file has closed. The first normalizer pass reads Deribit BTC raw files, rebuilds the instrument metadata table from `public/get_instruments` and `instrument.creation`, then joins that metadata onto ticker and trade rows.
+Use the separate `modl-normalize` binary after a UTC day file has closed. The normalizer reads supported non-Extended raw websocket files in bounded batches and writes daily Parquet datasets. Extended remains raw-only for now because its full orderbook stream still needs dedicated depth-state handling.
 
 ```sh
 cargo run --release --bin modl-normalize -- \
@@ -198,16 +198,47 @@ target/release/modl btc
 target/release/modl-normalize --date 2026-06-29
 ```
 
-Normalized Deribit files are daily Parquet datasets:
+Normalized files are daily Parquet datasets:
 
 ```text
 ws_normalized/
+  bitfinex/tbtcusd/book_l25/tbtcusd_book_l25_26-06-29.parquet
+  bitfinex/tbtcusd/trades/tbtcusd_trades_26-06-29.parquet
   deribit/btc/instruments/btc_instruments_26-06-29.parquet
+  deribit/btc/instrument_state/btc_instrument_state_26-06-29.parquet
   deribit/btc/incremental_ticker/btc_incremental_ticker_26-06-29.parquet
   deribit/btc/trades/btc_trades_26-06-29.parquet
+  hibachi/btc_usdt-p/funding/btc_usdt-p_funding_26-06-29.parquet
+  hibachi/btc_usdt-p/orderbook/btc_usdt-p_orderbook_26-06-29.parquet
+  hibachi/btc_usdt-p/prices/btc_usdt-p_prices_26-06-29.parquet
+  hibachi/btc_usdt-p/quotes/btc_usdt-p_quotes_26-06-29.parquet
+  hibachi/btc_usdt-p/trades/btc_usdt-p_trades_26-06-29.parquet
+  hyperliquid/ubtc_usdc/book/ubtc_usdc_book_26-06-29.parquet
+  hyperliquid/ubtc_usdc/control/ubtc_usdc_control_26-06-29.parquet
+  hyperliquid/ubtc_usdc/trades/ubtc_usdc_trades_26-06-29.parquet
 ```
 
-`instruments` is keyed by `instrument_name`. `incremental_ticker` and `trades` include the raw Deribit event values plus joined `kind`, `expiration_timestamp`, `strike`, `option_type`, and `settlement_period`. Financial numeric values are stored as UTF-8 decimal strings in this layer to avoid precision loss; downstream feature jobs can derive float columns from these exact strings when needed for model training.
+Deribit `instruments` is keyed by `instrument_name`. Deribit `incremental_ticker` and `trades` include the raw event values plus joined `kind`, `expiration_timestamp`, `strike`, `option_type`, and `settlement_period`. Bitfinex trades preserve snapshots, `te`, and `tu` rows; use `is_final = true` to select canonical snapshot/`tu` trades for features. Trade sides are canonicalized to `buy`/`sell` where the venue sends side tokens, with provider tokens retained as `raw_taker_side` for Hibachi and `raw_side` for Hyperliquid. Bitfinex and Hyperliquid book datasets are normalized as one row per book level in each snapshot/update message. Hibachi's multi-topic stream is split into `trades`, `orderbook`, `quotes`, `prices`, and `funding`. Financial numeric values are stored as UTF-8 decimal strings in this layer to avoid precision loss; downstream feature jobs can derive float columns from these exact strings when needed for model training.
+
+## Paper Trading Recorder
+
+The paper trading recorder notebook builds an append-only JSONL event log for the current quote-policy candidate. It records decision, replay projection, market snapshot, submit, ack, cancel, cancel ack, and fill events with a hash chain so paper/live behavior can be compared against the historical replay model. The paper trading runtime notebook consumes public trades through a paper order manager, applies queue-ahead, and compares independent replay-style orders with realistic quote replacement.
+
+Run it with the burner notebook environment:
+
+```sh
+MPLBACKEND=Agg PYTHONDONTWRITEBYTECODE=1 \
+  /home/skier/Documents/burner/btc-vol-strategy/.venv/bin/python
+```
+
+Open `notebooks/paper_trading_recorder.ipynb` or `notebooks/paper_trading_runtime.ipynb` in Jupyter for the interactive versions. By default dry-run JSONL is written under `/tmp/modl_paper_trading_recorder` and runtime JSONL under `/tmp/modl_paper_trading_runtime`. For persistent paper logs, set:
+
+```sh
+export MODL_PAPER_OUTPUT_ROOT=/mnt/burner-archive/paper_trading
+export MODL_PAPER_RUNTIME_OUTPUT_ROOT=/mnt/burner-archive/paper_trading_runtime
+export MODL_PAPER_RUN_ID=paper-$(date -u +%Y%m%dT%H%M%SZ)
+export MODL_PAPER_RUNTIME_RUN_ID=runtime-$(date -u +%Y%m%dT%H%M%SZ)
+```
 
 ## Rate Limit Behavior
 
