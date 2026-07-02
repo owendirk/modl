@@ -14,6 +14,7 @@ from scipy.stats import norm, skewnorm
 
 MINUTES_PER_YEAR = 365 * 24 * 60
 DEFAULT_BAR_MINUTES = 5
+DEFAULT_HAWKES_BSI_KAPPAS = (0.1, 0.3, 0.5)
 FEATURE_DATASET_KEYS = frozenset(
     [
         "bitfinex/tbtcusd/book_l25",
@@ -57,6 +58,7 @@ class FeatureSet:
     futures_basis: pd.DataFrame
     funding_features: pd.DataFrame
     rv_features: pd.DataFrame
+    hawkes_bsi_features: pd.DataFrame
     reference_price: pd.Series
 
 
@@ -913,6 +915,72 @@ def wide_by_venue(frame: pl.DataFrame, values: list[str], prefix: str) -> pd.Dat
     return wide.sort_index()
 
 
+def hawkes_kappa_label(kappa: float) -> str:
+    return f"k{int(round(kappa * 100)):03d}"
+
+
+def hawkes_decay(values: pd.Series, kappa: float) -> pd.Series:
+    alpha = float(np.exp(-kappa))
+    state = 0.0
+    out = np.empty(len(values), dtype=float)
+    for idx, value in enumerate(pd.Series(values).fillna(0.0).to_numpy(dtype=float)):
+        state = state * alpha + value
+        out[idx] = state
+    return pd.Series(out, index=values.index)
+
+
+def build_hawkes_bsi_features(
+    trade_features: pl.DataFrame,
+    kappas: tuple[float, ...] = DEFAULT_HAWKES_BSI_KAPPAS,
+    bar_minutes: int = DEFAULT_BAR_MINUTES,
+) -> pd.DataFrame:
+    pdf = trade_features.to_pandas()
+    if pdf.empty or not {"minute", "venue", "signed_volume", "volume"}.issubset(pdf.columns):
+        return pd.DataFrame()
+
+    pdf = pdf.copy()
+    pdf["minute"] = pd.to_datetime(pdf["minute"])
+    pdf = pdf.sort_values(["venue", "minute"])
+    start = pdf["minute"].min()
+    end = pdf["minute"].max()
+    if pd.isna(start) or pd.isna(end):
+        return pd.DataFrame()
+
+    index = pd.date_range(start=start, end=end, freq=f"{bar_minutes}min")
+    out = pd.DataFrame(index=index)
+    norm_columns_by_kappa: dict[str, list[str]] = {}
+
+    for venue, venue_df in pdf.groupby("venue", sort=True):
+        bars = (
+            venue_df.set_index("minute")[["signed_volume", "volume"]]
+            .apply(pd.to_numeric, errors="coerce")
+            .reindex(index)
+            .fillna(0.0)
+        )
+        for kappa in kappas:
+            label = hawkes_kappa_label(kappa)
+            bsi = hawkes_decay(bars["signed_volume"], kappa)
+            volume_memory = hawkes_decay(bars["volume"], kappa).replace(0.0, np.nan)
+            normalized = bsi / volume_memory
+
+            raw_col = f"hawkes_bsi_{label}_{venue}"
+            norm_col = f"hawkes_bsi_norm_{label}_{venue}"
+            out[raw_col] = bsi
+            out[norm_col] = normalized
+            out[f"hawkes_bsi_norm_diff_{label}_{venue}"] = normalized.diff()
+            norm_columns_by_kappa.setdefault(label, []).append(norm_col)
+
+    for label, columns in norm_columns_by_kappa.items():
+        normalized = out[columns]
+        out[f"hawkes_bsi_norm_mean_{label}"] = normalized.mean(axis=1)
+        out[f"hawkes_bsi_norm_std_{label}"] = normalized.std(axis=1)
+        out[f"hawkes_bsi_norm_range_{label}"] = normalized.max(axis=1) - normalized.min(axis=1)
+        out[f"hawkes_bsi_norm_positive_share_{label}"] = (normalized > 0).mean(axis=1)
+
+    out.index.name = "minute"
+    return out
+
+
 def add_rolling_transforms(
     frame: pd.DataFrame,
     windows: tuple[int, ...] = (5, 15, 30),
@@ -970,6 +1038,7 @@ def build_feature_set(
     term_structure = build_term_structure_features(datasets, bar_minutes=bar_minutes)
     option_smile = build_option_smile_features(datasets, bar_minutes=bar_minutes)
     futures_basis = build_deribit_futures_basis_features(datasets, bar_minutes=bar_minutes)
+    hawkes_bsi_features = build_hawkes_bsi_features(trade_features, bar_minutes=bar_minutes)
 
     trade_wide = wide_by_venue(trade_features, ["vwap", "volume", "trade_count", "flow_imbalance"], "trade")
     book_wide = wide_by_venue(book_features, ["mid", "spread_bps", "top_imbalance", "depth_imbalance"], "book")
@@ -981,7 +1050,7 @@ def build_feature_set(
     rv_features = build_realized_features(reference_price, horizons, bar_minutes=bar_minutes)
 
     feature_matrix = pd.concat(
-        [base_with_cross, rv_features, term_structure, option_smile, futures_basis],
+        [base_with_cross, rv_features, term_structure, option_smile, futures_basis, hawkes_bsi_features],
         axis=1,
     ).sort_index()
     feature_matrix = feature_matrix.loc[:, ~feature_matrix.columns.duplicated()]
@@ -1002,6 +1071,7 @@ def build_feature_set(
         futures_basis=futures_basis,
         funding_features=funding_features,
         rv_features=rv_features,
+        hawkes_bsi_features=hawkes_bsi_features,
         reference_price=reference_price,
     )
 
