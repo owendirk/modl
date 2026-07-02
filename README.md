@@ -220,6 +220,24 @@ ws_normalized/
 
 Deribit `instruments` is keyed by `instrument_name`. Deribit `incremental_ticker` and `trades` include the raw event values plus joined `kind`, `expiration_timestamp`, `strike`, `option_type`, and `settlement_period`. Bitfinex trades preserve snapshots, `te`, and `tu` rows; use `is_final = true` to select canonical snapshot/`tu` trades for features. Trade sides are canonicalized to `buy`/`sell` where the venue sends side tokens, with provider tokens retained as `raw_taker_side` for Hibachi and `raw_side` for Hyperliquid. Bitfinex and Hyperliquid book datasets are normalized as one row per book level in each snapshot/update message. Hibachi's multi-topic stream is split into `trades`, `orderbook`, `quotes`, `prices`, and `funding`. Financial numeric values are stored as UTF-8 decimal strings in this layer to avoid precision loss; downstream feature jobs can derive float columns from these exact strings when needed for model training.
 
+## Paper Trading Recorder
+
+The paper trading recorder notebook builds an append-only JSONL event log for the current quote-policy candidate. It records decision, replay projection, market snapshot, submit, ack, cancel, cancel ack, and fill events with a hash chain so paper/live behavior can be compared against the historical replay model.
+
+Run it with the burner notebook environment:
+
+```sh
+MPLBACKEND=Agg PYTHONDONTWRITEBYTECODE=1 \
+  /home/skier/Documents/burner/btc-vol-strategy/.venv/bin/python
+```
+
+Open `notebooks/paper_trading_recorder.ipynb` in Jupyter for the interactive version. By default the dry-run JSONL is written under `/tmp/modl_paper_trading_recorder`. For persistent paper logs, set:
+
+```sh
+export MODL_PAPER_OUTPUT_ROOT=/mnt/burner-archive/paper_trading
+export MODL_PAPER_RUN_ID=paper-$(date -u +%Y%m%dT%H%M%SZ)
+```
+
 ## Rate Limit Behavior
 
 Bitfinex public REST limits are IP-based and vary by endpoint. The CLI defaults to `--rpm 10`, spacing requests through one shared async rate gate. Clone the same `BitfinexClient` if you add more workers later; do not create one client per worker unless you also share a limiter above them.
