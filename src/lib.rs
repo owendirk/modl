@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
-    io::{BufRead, BufReader, BufWriter, Write},
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use arrow_array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray};
+use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
@@ -45,6 +45,8 @@ use tokio_tungstenite::{
     },
 };
 
+mod normalizer;
+
 const API_BASE: &str = "https://api-pub.bitfinex.com/v2/";
 const DEFAULT_SYMBOL: &str = "tBTCUSD";
 const MAX_LIMIT: u16 = 10_000;
@@ -55,11 +57,12 @@ const CHECKPOINT_TMP_FILE: &str = ".checkpoint.json.tmp";
 const CHECKPOINT_VERSION: u8 = 1;
 const DEFAULT_WS_HEARTBEAT_SECS: u64 = 20;
 const DEFAULT_WS_OUTPUT_DIR: &str = "/mnt/burner-archive/ws_raw";
-const DEFAULT_NORMALIZED_OUTPUT_DIR: &str = "/mnt/burner-archive/ws_normalized";
+const DEFAULT_ZSTD_FRAME_EVENTS: usize = 50_000;
 const DEFAULT_EXTENDED_MARKET: &str = "BTC-USD";
 const DEFAULT_EXTENDED_SPOT_MARKET: &str = "BTCSPOT-USD";
 const DEFAULT_HIBACHI_SYMBOL: &str = "BTC/USDT-P";
 const DEFAULT_DERIBIT_TRADES_INTERVAL: &str = "100ms";
+const DEFAULT_DERIBIT_REFRESH_SECS: u64 = 300;
 const DERIBIT_SUBSCRIBE_CHUNK_SIZE: usize = 200;
 const DERIBIT_SUBSCRIBE_CHUNK_DELAY: Duration = Duration::from_millis(250);
 const DEFAULT_DERIBIT_WS_URL: &str = "wss://www.deribit.com/ws/api/v2";
@@ -80,20 +83,13 @@ struct Cli {
     history: HistoryArgs,
 }
 
-#[derive(Debug, Parser)]
-#[command(about = "Normalize raw websocket JSONL.zst files into daily Parquet datasets")]
-struct NormalizeCli {
-    #[command(flatten)]
-    args: NormalizeArgs,
-}
-
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Record stable BTC websocket venues to daily compressed JSONL.
     Btc(BtcArgs),
 
     /// Normalize raw websocket JSONL.zst files into daily Parquet datasets.
-    Normalize(NormalizeArgs),
+    Normalize(normalizer::NormalizeArgs),
 
     /// Record realtime websocket market data as daily compressed raw JSONL.
     Stream(StreamArgs),
@@ -177,7 +173,11 @@ struct StreamArgs {
     #[arg(long, env = "DERIBIT_WS_URL", default_value = DEFAULT_DERIBIT_WS_URL)]
     deribit_url: String,
 
-    /// Deribit BTC instrument kinds to track. Repeat the flag or pass comma-separated values.
+    /// Deribit currency to track.
+    #[arg(long, default_value = "BTC", value_parser = parse_deribit_currency)]
+    deribit_currency: String,
+
+    /// Deribit instrument kinds to track. Repeat the flag or pass comma-separated values.
     #[arg(
         long = "deribit-kind",
         value_enum,
@@ -198,9 +198,17 @@ struct StreamArgs {
     #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(i32).range(1..=22))]
     zstd_level: i32,
 
+    /// Close, append, and sync the current Zstd frame after this many raw events.
+    #[arg(long, default_value_t = DEFAULT_ZSTD_FRAME_EVENTS, value_parser = parse_positive_usize)]
+    zstd_frame_events: usize,
+
     /// Stop each feed after this many data messages. Mostly useful for smoke tests.
     #[arg(long)]
     max_messages: Option<usize>,
+
+    /// Print one progress line after this many messages per feed. Set to 0 to disable.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(usize))]
+    progress_every: usize,
 
     /// Delay before reconnecting a failed websocket.
     #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..=300))]
@@ -209,6 +217,10 @@ struct StreamArgs {
     /// Websocket protocol ping interval in seconds. Set to 0 to disable client pings.
     #[arg(long = "heartbeat-secs", default_value_t = DEFAULT_WS_HEARTBEAT_SECS, value_parser = clap::value_parser!(u64).range(0..=300))]
     heartbeat_secs: u64,
+
+    /// Refresh Deribit's active instrument list on the existing websocket. Set to 0 to disable.
+    #[arg(long, default_value_t = DEFAULT_DERIBIT_REFRESH_SECS, value_parser = clap::value_parser!(u64).range(0..=86_400))]
+    deribit_refresh_secs: u64,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -221,6 +233,10 @@ struct BtcArgs {
     #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(i32).range(1..=22))]
     zstd_level: i32,
 
+    /// Close, append, and sync the current Zstd frame after this many raw events.
+    #[arg(long, default_value_t = DEFAULT_ZSTD_FRAME_EVENTS, value_parser = parse_positive_usize)]
+    zstd_frame_events: usize,
+
     /// Stop each feed after this many data messages. Mostly useful for smoke tests.
     #[arg(long)]
     max_messages: Option<usize>,
@@ -233,32 +249,25 @@ struct BtcArgs {
     #[arg(long = "heartbeat-secs", default_value_t = DEFAULT_WS_HEARTBEAT_SECS, value_parser = clap::value_parser!(u64).range(0..=300))]
     heartbeat_secs: u64,
 
-    /// Hibachi websocket URL.
-    #[arg(long, env = "HIBACHI_WS_URL", default_value = DEFAULT_HIBACHI_MARKET_WS_URL)]
-    hibachi_url: String,
-
     /// Deribit websocket URL.
     #[arg(long, env = "DERIBIT_WS_URL", default_value = DEFAULT_DERIBIT_WS_URL)]
     deribit_url: String,
 
+    /// Deribit currency to track.
+    #[arg(long, default_value = "BTC", value_parser = parse_deribit_currency)]
+    deribit_currency: String,
+
+    /// Refresh Deribit's active instrument list on the existing websocket. Set to 0 to disable.
+    #[arg(long, default_value_t = DEFAULT_DERIBIT_REFRESH_SECS, value_parser = clap::value_parser!(u64).range(0..=86_400))]
+    deribit_refresh_secs: u64,
+
     /// Hyperliquid spot market coin to subscribe. Omit to resolve BTC spot as UBTC/USDC.
     #[arg(long)]
     hyperliquid_spot_coin: Option<String>,
-}
 
-#[derive(Clone, Debug, Args)]
-struct NormalizeArgs {
-    /// UTC capture day to normalize, formatted as YYYY-MM-DD.
-    #[arg(long, value_parser = parse_date)]
-    date: NaiveDate,
-
-    /// Raw websocket archive root.
-    #[arg(short = 'i', long = "input-dir", default_value = DEFAULT_WS_OUTPUT_DIR)]
-    input_dir: PathBuf,
-
-    /// Normalized Parquet output root.
-    #[arg(short = 'o', long = "output-dir", default_value = DEFAULT_NORMALIZED_OUTPUT_DIR)]
-    output_dir: PathBuf,
+    /// Print one progress line after this many messages per feed. Set to 0 to disable.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(usize))]
+    progress_every: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -281,6 +290,14 @@ impl DeribitInstrumentKind {
         match self {
             Self::Future => "future",
             Self::Option => "option",
+        }
+    }
+
+    fn from_deribit_str(value: &str) -> Option<Self> {
+        match value {
+            "future" => Some(Self::Future),
+            "option" => Some(Self::Option),
+            _ => None,
         }
     }
 }
@@ -507,7 +524,7 @@ pub async fn run_cli() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Commands::Btc(btc_args)) => run_stream_command(btc_stream_args(btc_args)).await,
-        Some(Commands::Normalize(normalize_args)) => run_normalize_command(&normalize_args),
+        Some(Commands::Normalize(normalize_args)) => normalizer::run_command(&normalize_args),
         Some(Commands::Stream(stream_args)) => run_stream_command(stream_args).await,
         None => run_history_command(cli.history).await,
     }
@@ -520,8 +537,7 @@ pub async fn run_cli() -> Result<()> {
 /// Returns an error when CLI validation fails, raw input files cannot be decoded, or normalized
 /// Parquet files cannot be written.
 pub fn run_normalize_cli() -> Result<()> {
-    let cli = NormalizeCli::parse();
-    run_normalize_command(&cli.args)
+    normalizer::run_cli()
 }
 
 fn install_default_crypto_provider() {
@@ -591,8 +607,9 @@ async fn run_stream_command(args: StreamArgs) -> Result<()> {
 
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("received Ctrl+C; stopping websocket recorders");
+            signal = shutdown_signal() => {
+                let signal_name = signal?;
+                eprintln!("received {signal_name}; stopping websocket recorders");
                 let _ = shutdown_tx.send(true);
                 while let Some(result) = join_set.join_next().await {
                     result.context("stream task panicked")??;
@@ -609,11 +626,33 @@ async fn run_stream_command(args: StreamArgs) -> Result<()> {
     }
 }
 
+#[cfg(unix)]
+async fn shutdown_signal() -> Result<&'static str> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut interrupt = signal(SignalKind::interrupt()).context("failed to listen for SIGINT")?;
+    let mut terminate = signal(SignalKind::terminate()).context("failed to listen for SIGTERM")?;
+    let mut hangup = signal(SignalKind::hangup()).context("failed to listen for SIGHUP")?;
+
+    tokio::select! {
+        _ = interrupt.recv() => Ok("SIGINT"),
+        _ = terminate.recv() => Ok("SIGTERM"),
+        _ = hangup.recv() => Ok("SIGHUP"),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> Result<&'static str> {
+    tokio::signal::ctrl_c()
+        .await
+        .context("failed to listen for Ctrl+C")?;
+    Ok("Ctrl+C")
+}
+
 fn btc_stream_args(args: BtcArgs) -> StreamArgs {
     StreamArgs {
         venues: vec![
             StreamVenue::Bitfinex,
-            StreamVenue::Hibachi,
             StreamVenue::Deribit,
             StreamVenue::Hyperliquid,
         ],
@@ -622,13 +661,17 @@ fn btc_stream_args(args: BtcArgs) -> StreamArgs {
         extended_market: DEFAULT_EXTENDED_MARKET.to_owned(),
         extended_spot_market: DEFAULT_EXTENDED_SPOT_MARKET.to_owned(),
         hibachi_symbol: DEFAULT_HIBACHI_SYMBOL.to_owned(),
-        hibachi_url: args.hibachi_url,
+        hibachi_url: DEFAULT_HIBACHI_MARKET_WS_URL.to_owned(),
         deribit_url: args.deribit_url,
+        deribit_currency: args.deribit_currency,
         deribit_kinds: vec![DeribitInstrumentKind::Future, DeribitInstrumentKind::Option],
         deribit_trades_interval: DEFAULT_DERIBIT_TRADES_INTERVAL.to_owned(),
+        deribit_refresh_secs: args.deribit_refresh_secs,
         hyperliquid_spot_coin: args.hyperliquid_spot_coin,
         zstd_level: args.zstd_level,
+        zstd_frame_events: args.zstd_frame_events,
         max_messages: args.max_messages,
+        progress_every: args.progress_every,
         reconnect_delay_secs: args.reconnect_delay_secs,
         heartbeat_secs: args.heartbeat_secs,
     }
@@ -739,56 +782,69 @@ async fn run_static_feed_once(
         &spec.symbol,
         spec.channel,
         args.zstd_level,
+        args.zstd_frame_events,
     )?;
     let mut heartbeat = HeartbeatState::new(args.heartbeat_secs, spec.heartbeat_policy);
 
-    let status = loop {
-        match next_websocket_event(
-            &mut socket_read,
-            &mut socket_write,
-            &mut heartbeat,
-            &spec.connection_id,
-            shutdown,
-        )
-        .await?
-        {
-            NextWebsocketEvent::HeartbeatSent => continue,
-            NextWebsocketEvent::Shutdown => break FeedRunStatus::Complete,
-            NextWebsocketEvent::Closed => break FeedRunStatus::Reconnect,
-            NextWebsocketEvent::Message(message) => {
-                let Some(message) = websocket_message_or_reconnect(message, &spec.connection_id)?
-                else {
-                    break FeedRunStatus::Reconnect;
-                };
-                let message_status = handle_websocket_message(
-                    message,
-                    spec,
-                    &mut socket_write,
-                    &mut event_writer,
-                    &mut heartbeat,
-                    total_messages,
-                )
-                .await?;
-                if message_status == FeedMessageStatus::Reconnect {
-                    break FeedRunStatus::Reconnect;
+    let status_result: Result<FeedRunStatus> = async {
+        let status = loop {
+            match next_websocket_event(
+                &mut socket_read,
+                &mut socket_write,
+                &mut heartbeat,
+                &spec.connection_id,
+                shutdown,
+            )
+            .await?
+            {
+                NextWebsocketEvent::HeartbeatSent => continue,
+                NextWebsocketEvent::Shutdown => break FeedRunStatus::Complete,
+                NextWebsocketEvent::Closed => break FeedRunStatus::Reconnect,
+                NextWebsocketEvent::Message(message) => {
+                    let Some(message) =
+                        websocket_message_or_reconnect(message, &spec.connection_id)?
+                    else {
+                        break FeedRunStatus::Reconnect;
+                    };
+                    let message_status = handle_websocket_message(
+                        message,
+                        spec,
+                        &mut socket_write,
+                        &mut event_writer,
+                        &mut heartbeat,
+                        total_messages,
+                        args.progress_every,
+                    )
+                    .await?;
+                    if message_status == FeedMessageStatus::Reconnect {
+                        break FeedRunStatus::Reconnect;
+                    }
                 }
             }
-        }
 
-        if args
-            .max_messages
-            .is_some_and(|max_messages| *total_messages >= max_messages)
-        {
-            eprintln!(
-                "{} reached max message count ({})",
-                spec.connection_id, total_messages
-            );
-            break FeedRunStatus::Complete;
-        }
-    };
+            if args
+                .max_messages
+                .is_some_and(|max_messages| *total_messages >= max_messages)
+            {
+                eprintln!(
+                    "{} reached max message count ({})",
+                    spec.connection_id, total_messages
+                );
+                break FeedRunStatus::Complete;
+            }
+        };
+        Ok(status)
+    }
+    .await;
 
-    event_writer.close()?;
-    Ok(status)
+    finish_feed_run(
+        status_result,
+        event_writer.close(),
+        &format!(
+            "failed to close raw event writer for {}",
+            spec.connection_id
+        ),
+    )
 }
 
 async fn run_deribit_feed_once(
@@ -822,86 +878,147 @@ async fn run_deribit_feed_once(
         .with_context(|| format!("failed to connect {}", spec.url))?;
     let (mut socket_write, mut socket_read) = socket.split();
 
+    initialize_deribit_subscriptions(&mut socket_write, runtime_state, spec, args).await?;
+
+    let mut event_writers = DeribitCompressedEventWriters::create(
+        &args.output_dir,
+        args.zstd_level,
+        args.zstd_frame_events,
+        &args.deribit_currency,
+    );
+    let mut heartbeat = HeartbeatState::new(args.heartbeat_secs, spec.heartbeat_policy);
+    let mut refresh_ticks = deribit_refresh_interval(args.deribit_refresh_secs);
+
+    let status_result: Result<FeedRunStatus> = async {
+        let status = loop {
+            match next_deribit_event(
+                &mut socket_read,
+                &mut socket_write,
+                &mut heartbeat,
+                &spec.connection_id,
+                shutdown,
+                &mut refresh_ticks,
+            )
+            .await?
+            {
+                NextDeribitEvent::RefreshInstruments => {
+                    send_deribit_get_instruments_requests(
+                        &mut socket_write,
+                        runtime_state,
+                        &spec.connection_id,
+                        &args.deribit_kinds,
+                        &args.deribit_currency,
+                    )
+                    .await?;
+                    continue;
+                }
+                NextDeribitEvent::Websocket(NextWebsocketEvent::HeartbeatSent) => continue,
+                NextDeribitEvent::Websocket(NextWebsocketEvent::Shutdown) => {
+                    break FeedRunStatus::Complete;
+                }
+                NextDeribitEvent::Websocket(NextWebsocketEvent::Closed) => {
+                    break FeedRunStatus::Reconnect;
+                }
+                NextDeribitEvent::Websocket(NextWebsocketEvent::Message(message)) => {
+                    let Some(message) =
+                        websocket_message_or_reconnect(message, &spec.connection_id)?
+                    else {
+                        break FeedRunStatus::Reconnect;
+                    };
+                    let mut context = DeribitMessageContext {
+                        spec,
+                        args,
+                        socket_write: &mut socket_write,
+                        event_writers: &mut event_writers,
+                        heartbeat: &mut heartbeat,
+                        total_messages,
+                        runtime_state,
+                    };
+                    let message_status =
+                        handle_deribit_websocket_message(message, &mut context).await?;
+                    if message_status == FeedMessageStatus::Reconnect {
+                        break FeedRunStatus::Reconnect;
+                    }
+                }
+            }
+
+            if args
+                .max_messages
+                .is_some_and(|max_messages| *total_messages >= max_messages)
+            {
+                eprintln!(
+                    "{} reached max message count ({})",
+                    spec.connection_id, total_messages
+                );
+                break FeedRunStatus::Complete;
+            }
+        };
+        Ok(status)
+    }
+    .await;
+
+    finish_feed_run(
+        status_result,
+        event_writers.close(),
+        &format!(
+            "failed to close Deribit raw event writers for {}",
+            spec.connection_id
+        ),
+    )
+}
+
+fn finish_feed_run(
+    status_result: Result<FeedRunStatus>,
+    close_result: Result<()>,
+    close_context: &str,
+) -> Result<FeedRunStatus> {
+    match (status_result, close_result) {
+        (Ok(status), Ok(())) => Ok(status),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(close_error)) => Err(close_error).with_context(|| close_context.to_owned()),
+        (Err(error), Err(close_error)) => Err(error).with_context(|| {
+            format!("{close_context}; additionally failed to finish writer: {close_error:#}")
+        }),
+    }
+}
+
+async fn initialize_deribit_subscriptions<S>(
+    socket_write: &mut S,
+    runtime_state: &mut FeedRuntimeState,
+    spec: &FeedSpec,
+    args: &StreamArgs,
+) -> Result<()>
+where
+    S: Sink<Message, Error = WsError> + Unpin,
+{
     send_deribit_set_heartbeat(
-        &mut socket_write,
+        socket_write,
         runtime_state,
         &spec.connection_id,
         args.heartbeat_secs,
     )
     .await?;
 
-    let mut initial_channels = deribit_lifecycle_channels(&args.deribit_kinds);
-    initial_channels.extend(runtime_state.instruments.iter().flat_map(|instrument| {
+    let mut initial_channels =
+        deribit_lifecycle_channels(&args.deribit_kinds, &args.deribit_currency);
+    initial_channels.extend(runtime_state.instruments.keys().flat_map(|instrument| {
         deribit_instrument_channels(instrument, &args.deribit_trades_interval)
     }));
     send_deribit_subscribe(
-        &mut socket_write,
+        socket_write,
         runtime_state,
         &spec.connection_id,
         initial_channels,
     )
     .await?;
     send_deribit_get_instruments_requests(
-        &mut socket_write,
+        socket_write,
         runtime_state,
         &spec.connection_id,
         &args.deribit_kinds,
+        &args.deribit_currency,
     )
-    .await?;
-
-    let mut event_writers =
-        DeribitCompressedEventWriters::create(&args.output_dir, args.zstd_level);
-    let mut heartbeat = HeartbeatState::new(args.heartbeat_secs, spec.heartbeat_policy);
-
-    let status = loop {
-        match next_websocket_event(
-            &mut socket_read,
-            &mut socket_write,
-            &mut heartbeat,
-            &spec.connection_id,
-            shutdown,
-        )
-        .await?
-        {
-            NextWebsocketEvent::HeartbeatSent => continue,
-            NextWebsocketEvent::Shutdown => break FeedRunStatus::Complete,
-            NextWebsocketEvent::Closed => break FeedRunStatus::Reconnect,
-            NextWebsocketEvent::Message(message) => {
-                let Some(message) = websocket_message_or_reconnect(message, &spec.connection_id)?
-                else {
-                    break FeedRunStatus::Reconnect;
-                };
-                let mut context = DeribitMessageContext {
-                    spec,
-                    args,
-                    socket_write: &mut socket_write,
-                    event_writers: &mut event_writers,
-                    heartbeat: &mut heartbeat,
-                    total_messages,
-                    runtime_state,
-                };
-                let message_status =
-                    handle_deribit_websocket_message(message, &mut context).await?;
-                if message_status == FeedMessageStatus::Reconnect {
-                    break FeedRunStatus::Reconnect;
-                }
-            }
-        }
-
-        if args
-            .max_messages
-            .is_some_and(|max_messages| *total_messages >= max_messages)
-        {
-            eprintln!(
-                "{} reached max message count ({})",
-                spec.connection_id, total_messages
-            );
-            break FeedRunStatus::Complete;
-        }
-    };
-
-    event_writers.close()?;
-    Ok(status)
+    .await
 }
 
 async fn send_deribit_set_heartbeat<S>(
@@ -983,24 +1100,71 @@ where
     Ok(())
 }
 
+async fn send_deribit_unsubscribe<S>(
+    socket_write: &mut S,
+    runtime_state: &mut FeedRuntimeState,
+    connection_id: &str,
+    channels: Vec<String>,
+) -> Result<()>
+where
+    S: Sink<Message, Error = WsError> + Unpin,
+{
+    if channels.is_empty() {
+        return Ok(());
+    }
+
+    let count = channels.len();
+    let chunk_count = channels.chunks(DERIBIT_SUBSCRIBE_CHUNK_SIZE).len();
+    for (index, channel_chunk) in channels.chunks(DERIBIT_SUBSCRIBE_CHUNK_SIZE).enumerate() {
+        let id = runtime_state.next_deribit_request_id();
+        let text = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "public/unsubscribe",
+            "id": id,
+            "params": {
+                "channels": channel_chunk,
+            }
+        })
+        .to_string();
+
+        socket_write
+            .send(Message::Text(text.into()))
+            .await
+            .with_context(|| format!("failed to send Deribit unsubscribe on {connection_id}"))?;
+        socket_write
+            .flush()
+            .await
+            .with_context(|| format!("failed to flush Deribit unsubscribe on {connection_id}"))?;
+
+        if index + 1 < chunk_count {
+            sleep(DERIBIT_SUBSCRIBE_CHUNK_DELAY).await;
+        }
+    }
+    eprintln!(
+        "{connection_id} unsubscribed from {count} Deribit channel(s) in {chunk_count} request(s)"
+    );
+    Ok(())
+}
+
 async fn send_deribit_get_instruments_requests<S>(
     socket_write: &mut S,
     runtime_state: &mut FeedRuntimeState,
     connection_id: &str,
     kinds: &[DeribitInstrumentKind],
+    currency: &str,
 ) -> Result<()>
 where
     S: Sink<Message, Error = WsError> + Unpin,
 {
     for (index, kind) in kinds.iter().copied().enumerate() {
         let id = runtime_state.next_deribit_request_id();
-        runtime_state.get_instruments_request_ids.insert(id);
+        runtime_state.get_instruments_request_ids.insert(id, kind);
         let text = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "public/get_instruments",
             "id": id,
             "params": {
-                "currency": "BTC",
+                "currency": currency,
                 "kind": kind.as_str(),
                 "expired": false,
             }
@@ -1014,7 +1178,7 @@ where
                 format!("failed to send Deribit get_instruments request on {connection_id}")
             })?;
         eprintln!(
-            "{connection_id} requested current BTC {} instruments",
+            "{connection_id} requested current {currency} {} instruments",
             kind.as_str()
         );
 
@@ -1075,59 +1239,82 @@ async fn run_hyperliquid_spot_feed_once(
         "hyperliquid-{} subscribed to trades and l2Book for {}",
         target.output_symbol, target.subscription_coin
     );
+    let progress_connection_id = format!("hyperliquid-{}", target.output_symbol);
 
     let mut event_writers = HyperliquidCompressedEventWriters::create(
         &args.output_dir,
         &target.output_symbol,
         args.zstd_level,
+        args.zstd_frame_events,
     );
 
-    loop {
-        tokio::select! {
-            result = shutdown.changed() => {
-                let shutdown_event = shutdown_event(result.is_err(), shutdown);
-                if matches!(shutdown_event, NextWebsocketEvent::Shutdown) {
-                    break;
+    let status_result: Result<FeedRunStatus> = async {
+        let status = loop {
+            tokio::select! {
+                result = shutdown.changed() => {
+                    let shutdown_event = shutdown_event(result.is_err(), shutdown);
+                    if matches!(shutdown_event, NextWebsocketEvent::Shutdown) {
+                        break FeedRunStatus::Complete;
+                    }
                 }
-            }
-            event = ws.next() => {
-                let Some(event) = event else {
-                    break;
-                };
-                handle_hyperliquid_event(event, &mut event_writers)?;
-                *total_messages += 1;
-
-                if args.max_messages.is_some_and(|max_messages| *total_messages >= max_messages) {
-                    eprintln!(
-                        "hyperliquid-{} reached max message count ({})",
-                        target.output_symbol, total_messages
+                event = ws.next() => {
+                    let Some(event) = event else {
+                        break FeedRunStatus::Reconnect;
+                    };
+                    let message_status = handle_hyperliquid_event(event, &mut event_writers)?;
+                    if message_status == FeedMessageStatus::Reconnect {
+                        break FeedRunStatus::Reconnect;
+                    }
+                    *total_messages += 1;
+                    maybe_log_stream_progress(
+                        &progress_connection_id,
+                        *total_messages,
+                        args.progress_every,
                     );
-                    break;
+
+                    if args.max_messages.is_some_and(|max_messages| *total_messages >= max_messages) {
+                        eprintln!(
+                            "hyperliquid-{} reached max message count ({})",
+                            target.output_symbol, total_messages
+                        );
+                        break FeedRunStatus::Complete;
+                    }
                 }
             }
-        }
+        };
+        Ok(status)
     }
+    .await;
 
-    event_writers.close()?;
-    Ok(FeedRunStatus::Complete)
+    finish_feed_run(
+        status_result,
+        event_writers.close(),
+        &format!(
+            "failed to close Hyperliquid raw event writers for {}",
+            target.output_symbol
+        ),
+    )
 }
 
 fn handle_hyperliquid_event(
     event: HyperliquidEvent,
     event_writers: &mut HyperliquidCompressedEventWriters,
-) -> Result<()> {
+) -> Result<FeedMessageStatus> {
     match event {
         HyperliquidEvent::Connected => {
-            event_writers.write_control_event(&serde_json::json!({"event": "connected"}))
+            event_writers.write_control_event(&serde_json::json!({"event": "connected"}))?;
+            Ok(FeedMessageStatus::Continue)
         }
         HyperliquidEvent::Disconnected => {
-            event_writers.write_control_event(&serde_json::json!({"event": "disconnected"}))
+            event_writers.write_control_event(&serde_json::json!({"event": "disconnected"}))?;
+            Ok(FeedMessageStatus::Reconnect)
         }
         HyperliquidEvent::Message(message) => {
             let channel = hyperliquid_output_channel(&message);
             let text = serde_json::to_string(&message)
                 .context("failed to encode Hyperliquid websocket event")?;
-            event_writers.write_text_event(channel, &text)
+            event_writers.write_text_event(channel, &text)?;
+            Ok(FeedMessageStatus::Continue)
         }
     }
 }
@@ -1216,6 +1403,57 @@ where
     }
 }
 
+async fn next_deribit_event<R, S>(
+    socket_read: &mut R,
+    socket_write: &mut S,
+    heartbeat: &mut HeartbeatState,
+    connection_id: &str,
+    shutdown: &mut watch::Receiver<bool>,
+    refresh_ticks: &mut Option<Interval>,
+) -> Result<NextDeribitEvent>
+where
+    R: Stream<Item = Result<Message, WsError>> + Unpin,
+    S: Sink<Message, Error = WsError> + Unpin,
+{
+    if refresh_ticks.is_some() {
+        tokio::select! {
+            event = next_websocket_event(socket_read, socket_write, heartbeat, connection_id, shutdown) => {
+                event.map(NextDeribitEvent::Websocket)
+            }
+            () = deribit_refresh_tick(refresh_ticks) => Ok(NextDeribitEvent::RefreshInstruments),
+        }
+    } else {
+        next_websocket_event(
+            socket_read,
+            socket_write,
+            heartbeat,
+            connection_id,
+            shutdown,
+        )
+        .await
+        .map(NextDeribitEvent::Websocket)
+    }
+}
+
+async fn deribit_refresh_tick(refresh_ticks: &mut Option<Interval>) {
+    if let Some(ticks) = refresh_ticks {
+        ticks.tick().await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+fn deribit_refresh_interval(refresh_secs: u64) -> Option<Interval> {
+    if refresh_secs == 0 {
+        return None;
+    }
+
+    let duration = Duration::from_secs(refresh_secs);
+    let mut ticks = interval_at(Instant::now() + duration, duration);
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    Some(ticks)
+}
+
 fn shutdown_event(shutdown_closed: bool, shutdown: &watch::Receiver<bool>) -> NextWebsocketEvent {
     if !shutdown_closed && !*shutdown.borrow() {
         return NextWebsocketEvent::HeartbeatSent;
@@ -1244,6 +1482,12 @@ fn websocket_message_or_reconnect(
     }
 }
 
+fn maybe_log_stream_progress(connection_id: &str, total_messages: usize, progress_every: usize) {
+    if progress_every > 0 && total_messages % progress_every == 0 {
+        eprintln!("progress {connection_id} messages={total_messages}");
+    }
+}
+
 fn is_expected_websocket_reconnect_error(error: &WsError) -> bool {
     match error {
         WsError::ConnectionClosed
@@ -1265,6 +1509,7 @@ async fn handle_websocket_message<S>(
     event_writer: &mut DailyCompressedEventWriter,
     heartbeat: &mut HeartbeatState,
     total_messages: &mut usize,
+    progress_every: usize,
 ) -> Result<FeedMessageStatus>
 where
     S: Sink<Message, Error = WsError> + Unpin,
@@ -1274,10 +1519,12 @@ where
             let text = text.as_str();
             event_writer.write_text_event(spec, text)?;
             *total_messages += 1;
+            maybe_log_stream_progress(&spec.connection_id, *total_messages, progress_every);
         }
         Message::Binary(bytes) => {
             event_writer.write_binary_event(spec, &bytes)?;
             *total_messages += 1;
+            maybe_log_stream_progress(&spec.connection_id, *total_messages, progress_every);
         }
         Message::Ping(_) => flush_queued_pong(socket_write, &spec.connection_id).await?,
         Message::Pong(payload) => heartbeat.observe_pong(payload.as_ref()),
@@ -1321,6 +1568,7 @@ where
             )
             .await?;
             maybe_subscribe_deribit_get_instruments(text, context).await?;
+            maybe_update_deribit_instrument_state(text, context).await?;
             maybe_subscribe_deribit_created_instrument(
                 text,
                 context.args,
@@ -1330,12 +1578,22 @@ where
             )
             .await?;
             *context.total_messages += 1;
+            maybe_log_stream_progress(
+                &context.spec.connection_id,
+                *context.total_messages,
+                context.args.progress_every,
+            );
         }
         Message::Binary(bytes) => {
             context
                 .event_writers
                 .write_binary_event("control", &bytes)?;
             *context.total_messages += 1;
+            maybe_log_stream_progress(
+                &context.spec.connection_id,
+                *context.total_messages,
+                context.args.progress_every,
+            );
         }
         Message::Ping(_) => {
             flush_queued_pong(context.socket_write, &context.spec.connection_id).await?;
@@ -1388,33 +1646,38 @@ where
     let Some(response_id) = deribit_response_id(&message) else {
         return Ok(());
     };
-    if !context
+    let Some(kind) = context
         .runtime_state
         .get_instruments_request_ids
         .remove(&response_id)
-    {
+    else {
         return Ok(());
-    }
+    };
 
     if let Some(error) = message.get("error") {
         bail!("Deribit get_instruments failed: {error}");
     }
 
-    let instrument_names = deribit_instrument_names_from_get_instruments_response(
-        &message,
-        &context.args.deribit_kinds,
-    );
+    let current_instruments: HashSet<String> =
+        deribit_instrument_names_from_get_instruments_response(
+            &message,
+            &[kind],
+            &context.args.deribit_currency,
+        )
+        .into_iter()
+        .collect();
     let mut channels = Vec::new();
     let mut new_instruments = 0usize;
-    for instrument_name in instrument_names {
+    for instrument_name in &current_instruments {
         if context
             .runtime_state
             .instruments
-            .insert(instrument_name.clone())
+            .insert(instrument_name.clone(), kind)
+            .is_none()
         {
             new_instruments = new_instruments.saturating_add(1);
             channels.extend(deribit_instrument_channels(
-                &instrument_name,
+                instrument_name,
                 &context.args.deribit_trades_interval,
             ));
         }
@@ -1422,14 +1685,40 @@ where
 
     if !channels.is_empty() {
         eprintln!(
-            "{} discovered {new_instruments} current Deribit BTC instrument(s)",
-            context.spec.connection_id
+            "{} discovered {new_instruments} current Deribit {} instrument(s)",
+            context.spec.connection_id, context.args.deribit_currency
         );
         send_deribit_subscribe(
             context.socket_write,
             context.runtime_state,
             &context.spec.connection_id,
             channels,
+        )
+        .await?;
+    }
+
+    let expired_instruments: Vec<String> = context
+        .runtime_state
+        .instruments
+        .iter()
+        .filter(|(_, instrument_kind)| **instrument_kind == kind)
+        .filter(|(instrument_name, _)| !current_instruments.contains(*instrument_name))
+        .map(|(instrument_name, _)| instrument_name.clone())
+        .collect();
+    let mut expired_channels = Vec::new();
+    for instrument_name in expired_instruments {
+        context.runtime_state.instruments.remove(&instrument_name);
+        expired_channels.extend(deribit_instrument_channels(
+            &instrument_name,
+            &context.args.deribit_trades_interval,
+        ));
+    }
+    if !expired_channels.is_empty() {
+        send_deribit_unsubscribe(
+            context.socket_write,
+            context.runtime_state,
+            &context.spec.connection_id,
+            expired_channels,
         )
         .await?;
     }
@@ -1474,6 +1763,65 @@ fn deribit_response_id(message: &Value) -> Option<u64> {
     message.get("id").and_then(Value::as_u64)
 }
 
+async fn maybe_update_deribit_instrument_state<S>(
+    text: &str,
+    context: &mut DeribitMessageContext<'_, S>,
+) -> Result<()>
+where
+    S: Sink<Message, Error = WsError> + Unpin,
+{
+    let Ok(message) = serde_json::from_str::<Value>(text) else {
+        return Ok(());
+    };
+    let Some(update) = deribit_instrument_state_update(
+        &message,
+        &context.args.deribit_kinds,
+        &context.args.deribit_currency,
+    ) else {
+        return Ok(());
+    };
+
+    if update.active {
+        if context
+            .runtime_state
+            .instruments
+            .insert(update.instrument_name.clone(), update.kind)
+            .is_none()
+        {
+            let channels = deribit_instrument_channels(
+                &update.instrument_name,
+                &context.args.deribit_trades_interval,
+            );
+            send_deribit_subscribe(
+                context.socket_write,
+                context.runtime_state,
+                &context.spec.connection_id,
+                channels,
+            )
+            .await?;
+        }
+    } else if context
+        .runtime_state
+        .instruments
+        .remove(&update.instrument_name)
+        .is_some()
+    {
+        let channels = deribit_instrument_channels(
+            &update.instrument_name,
+            &context.args.deribit_trades_interval,
+        );
+        send_deribit_unsubscribe(
+            context.socket_write,
+            context.runtime_state,
+            &context.spec.connection_id,
+            channels,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
 async fn maybe_subscribe_deribit_created_instrument<S>(
     text: &str,
     args: &StreamArgs,
@@ -1487,53 +1835,136 @@ where
     let Ok(message) = serde_json::from_str::<Value>(text) else {
         return Ok(());
     };
-    let Some(instrument_name) = deribit_created_instrument_name(&message, &args.deribit_kinds)
+    let Some(created) =
+        deribit_created_instrument_name(&message, &args.deribit_kinds, &args.deribit_currency)
     else {
         return Ok(());
     };
 
-    if runtime_state.instruments.insert(instrument_name.clone()) {
-        let channels = deribit_instrument_channels(&instrument_name, &args.deribit_trades_interval);
+    if runtime_state
+        .instruments
+        .insert(created.instrument_name.clone(), created.kind)
+        .is_none()
+    {
+        let channels =
+            deribit_instrument_channels(&created.instrument_name, &args.deribit_trades_interval);
         send_deribit_subscribe(socket_write, runtime_state, connection_id, channels).await?;
     }
     Ok(())
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct DeribitCreatedInstrument {
+    instrument_name: String,
+    kind: DeribitInstrumentKind,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct DeribitInstrumentStateUpdate {
+    instrument_name: String,
+    kind: DeribitInstrumentKind,
+    active: bool,
+}
+
 fn deribit_created_instrument_name(
     message: &Value,
     allowed_kinds: &[DeribitInstrumentKind],
-) -> Option<String> {
+    currency: &str,
+) -> Option<DeribitCreatedInstrument> {
     let channel = deribit_message_channel(message)?;
-    if !channel.starts_with("instrument.creation.") {
+    let (kind, channel_currency) = deribit_lifecycle_channel_parts(channel, "creation")?;
+    if channel_currency != currency || !allowed_kinds.contains(&kind) {
         return None;
     }
 
     let data = deribit_message_data(message)?;
+    if !deribit_state_message_is_active(data) {
+        return None;
+    }
+
     if data
         .get("base_currency")
         .and_then(Value::as_str)
-        .is_some_and(|currency| currency != "BTC")
+        .is_some_and(|base_currency| base_currency != currency)
     {
         return None;
     }
 
-    if let Some(kind) = data.get("kind").and_then(Value::as_str) {
-        let allowed = allowed_kinds
-            .iter()
-            .any(|allowed_kind| allowed_kind.as_str() == kind);
-        if !allowed {
+    if let Some(data_kind) = data
+        .get("kind")
+        .and_then(Value::as_str)
+        .and_then(DeribitInstrumentKind::from_deribit_str)
+    {
+        if data_kind != kind {
             return None;
         }
     }
 
     data.get("instrument_name")
         .and_then(Value::as_str)
-        .map(str::to_owned)
+        .map(|instrument_name| DeribitCreatedInstrument {
+            instrument_name: instrument_name.to_owned(),
+            kind,
+        })
+}
+
+fn deribit_instrument_state_update(
+    message: &Value,
+    allowed_kinds: &[DeribitInstrumentKind],
+    currency: &str,
+) -> Option<DeribitInstrumentStateUpdate> {
+    let channel = deribit_message_channel(message)?;
+    let (kind, channel_currency) = deribit_lifecycle_channel_parts(channel, "state")?;
+    if channel_currency != currency || !allowed_kinds.contains(&kind) {
+        return None;
+    }
+
+    let data = deribit_message_data(message)?;
+    let instrument_name = data.get("instrument_name").and_then(Value::as_str)?;
+    Some(DeribitInstrumentStateUpdate {
+        instrument_name: instrument_name.to_owned(),
+        kind,
+        active: deribit_state_message_is_active(data),
+    })
+}
+
+fn deribit_lifecycle_channel_parts<'a>(
+    channel: &'a str,
+    event: &str,
+) -> Option<(DeribitInstrumentKind, &'a str)> {
+    let mut parts = channel.split('.');
+    if parts.next()? != "instrument" || parts.next()? != event {
+        return None;
+    }
+    let kind = DeribitInstrumentKind::from_deribit_str(parts.next()?)?;
+    let currency = parts.next()?;
+    parts.next().is_none().then_some((kind, currency))
+}
+
+fn deribit_state_message_is_active(data: &Value) -> bool {
+    if data
+        .get("is_active")
+        .and_then(Value::as_bool)
+        .is_some_and(|is_active| !is_active)
+    {
+        return false;
+    }
+
+    !data
+        .get("state")
+        .and_then(Value::as_str)
+        .is_some_and(|state| {
+            matches!(
+                state.to_ascii_lowercase().as_str(),
+                "closed" | "expired" | "inactive" | "settled"
+            )
+        })
 }
 
 fn deribit_instrument_names_from_get_instruments_response(
     message: &Value,
     allowed_kinds: &[DeribitInstrumentKind],
+    currency: &str,
 ) -> Vec<String> {
     let Some(instruments) = message.get("result").and_then(Value::as_array) else {
         return Vec::new();
@@ -1550,15 +1981,15 @@ fn deribit_instrument_names_from_get_instruments_response(
                 return None;
             }
 
-            let is_btc = instrument
+            let is_target_currency = instrument
                 .get("base_currency")
                 .and_then(Value::as_str)
-                .is_some_and(|currency| currency == "BTC")
+                .is_some_and(|base_currency| base_currency == currency)
                 || instrument
                     .get("product_group")
                     .and_then(Value::as_str)
-                    .is_some_and(|product_group| product_group == "BTC");
-            if !is_btc {
+                    .is_some_and(|product_group| product_group == currency);
+            if !is_target_currency {
                 return None;
             }
 
@@ -1601,13 +2032,13 @@ fn deribit_message_channel(message: &Value) -> Option<&str> {
     message.pointer("/params/channel").and_then(Value::as_str)
 }
 
-fn deribit_lifecycle_channels(kinds: &[DeribitInstrumentKind]) -> Vec<String> {
+fn deribit_lifecycle_channels(kinds: &[DeribitInstrumentKind], currency: &str) -> Vec<String> {
     kinds
         .iter()
         .flat_map(|kind| {
             [
-                format!("instrument.creation.{}.BTC", kind.as_str()),
-                format!("instrument.state.{}.BTC", kind.as_str()),
+                format!("instrument.creation.{}.{}", kind.as_str(), currency),
+                format!("instrument.state.{}.{}", kind.as_str(), currency),
             ]
         })
         .collect()
@@ -1722,6 +2153,12 @@ enum NextWebsocketEvent {
     Closed,
 }
 
+#[derive(Debug)]
+enum NextDeribitEvent {
+    Websocket(NextWebsocketEvent),
+    RefreshInstruments,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum FeedMessageStatus {
     Continue,
@@ -1736,8 +2173,8 @@ enum FeedRunStatus {
 
 #[derive(Default)]
 struct FeedRuntimeState {
-    instruments: HashSet<String>,
-    get_instruments_request_ids: HashSet<u64>,
+    instruments: HashMap<String, DeribitInstrumentKind>,
+    get_instruments_request_ids: HashMap<u64, DeribitInstrumentKind>,
     request_id: u64,
 }
 
@@ -1919,11 +2356,12 @@ fn hibachi_stream_spec(args: &StreamArgs) -> FeedSpec {
 }
 
 fn deribit_stream_spec(args: &StreamArgs) -> FeedSpec {
+    let currency = args.deribit_currency.clone();
     FeedSpec {
         exchange: "deribit",
-        symbol: "BTC".to_owned(),
+        symbol: currency.clone(),
         channel: "instrument_lifecycle",
-        connection_id: "deribit-BTC-instruments".to_owned(),
+        connection_id: format!("deribit-{currency}-instruments"),
         url: args.deribit_url.clone(),
         subscribe_messages: Vec::new(),
         behavior: FeedBehavior::DeribitInstrumentDiscovery,
@@ -1963,6 +2401,9 @@ fn validate_stream_args(args: &StreamArgs) -> Result<()> {
     if args.deribit_url.is_empty() {
         bail!("deribit URL cannot be empty");
     }
+    if args.deribit_currency.is_empty() {
+        bail!("deribit currency cannot be empty");
+    }
     if args.deribit_kinds.is_empty() {
         bail!("at least one --deribit-kind is required");
     }
@@ -1986,11 +2427,24 @@ fn parse_deribit_trades_interval(value: &str) -> Result<String, String> {
     }
 }
 
+fn parse_deribit_currency(value: &str) -> Result<String, String> {
+    let currency = value.trim().to_ascii_uppercase();
+    if currency.is_empty() {
+        return Err("Deribit currency cannot be empty".to_owned());
+    }
+    if !currency.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+        return Err("Deribit currency must contain only ASCII letters or numbers".to_owned());
+    }
+    Ok(currency)
+}
+
 struct DailyCompressedEventWriter {
     partition_dir: PathBuf,
     symbol_name: String,
     channel_name: String,
     zstd_level: i32,
+    frame_events: usize,
+    current_frame_events: usize,
     current_date: Option<NaiveDate>,
     current_writer: Option<zstd::stream::write::Encoder<'static, BufWriter<File>>>,
 }
@@ -2002,7 +2456,12 @@ impl DailyCompressedEventWriter {
         symbol: &str,
         channel: &str,
         zstd_level: i32,
+        frame_events: usize,
     ) -> Result<Self> {
+        if frame_events == 0 {
+            bail!("zstd frame event limit must be greater than zero");
+        }
+
         let exchange_name = symbol_partition_name(exchange)?;
         let symbol_name = symbol_partition_name(symbol)?;
         let channel_name = symbol_partition_name(channel)?;
@@ -2018,6 +2477,8 @@ impl DailyCompressedEventWriter {
             symbol_name,
             channel_name,
             zstd_level,
+            frame_events,
+            current_frame_events: 0,
             current_date: None,
             current_writer: None,
         })
@@ -2076,6 +2537,7 @@ impl DailyCompressedEventWriter {
                 })?,
             );
             self.current_date = Some(date);
+            self.current_frame_events = 0;
         }
 
         let writer = self
@@ -2087,13 +2549,23 @@ impl DailyCompressedEventWriter {
         writer
             .write_all(b"\n")
             .context("failed to write raw websocket newline")?;
+        self.current_frame_events = self.current_frame_events.saturating_add(1);
+        if self.current_frame_events >= self.frame_events {
+            self.close_current_writer()?;
+        }
         Ok(())
     }
 
     fn close_current_writer(&mut self) -> Result<()> {
         if let Some(writer) = self.current_writer.take() {
-            writer.finish().context("failed to finish zstd stream")?;
+            let mut writer = writer.finish().context("failed to finish zstd stream")?;
+            writer.flush().context("failed to flush zstd file")?;
+            writer
+                .get_ref()
+                .sync_data()
+                .context("failed to sync zstd file")?;
             self.current_date = None;
+            self.current_frame_events = 0;
         }
         Ok(())
     }
@@ -2105,28 +2577,32 @@ impl DailyCompressedEventWriter {
 
 struct DeribitCompressedEventWriters {
     output_dir: PathBuf,
+    currency: String,
     zstd_level: i32,
+    frame_events: usize,
     writers: HashMap<&'static str, DailyCompressedEventWriter>,
 }
 
 impl DeribitCompressedEventWriters {
-    fn create(output_dir: &Path, zstd_level: i32) -> Self {
+    fn create(output_dir: &Path, zstd_level: i32, frame_events: usize, currency: &str) -> Self {
         Self {
             output_dir: output_dir.to_path_buf(),
+            currency: currency.to_owned(),
             zstd_level,
+            frame_events,
             writers: HashMap::new(),
         }
     }
 
     fn write_text_event(&mut self, channel: &'static str, text: &str) -> Result<()> {
-        let spec = deribit_output_spec(channel);
+        let spec = deribit_output_spec(&self.currency, channel);
         self.writer(channel)?
             .write_text_event(&spec, text)
             .with_context(|| format!("failed to write Deribit {channel} text event"))
     }
 
     fn write_binary_event(&mut self, channel: &'static str, bytes: &[u8]) -> Result<()> {
-        let spec = deribit_output_spec(channel);
+        let spec = deribit_output_spec(&self.currency, channel);
         self.writer(channel)?
             .write_binary_event(&spec, bytes)
             .with_context(|| format!("failed to write Deribit {channel} binary event"))
@@ -2137,9 +2613,10 @@ impl DeribitCompressedEventWriters {
             let writer = DailyCompressedEventWriter::create(
                 &self.output_dir,
                 "deribit",
-                "BTC",
+                &self.currency,
                 channel,
                 self.zstd_level,
+                self.frame_events,
             )?;
             self.writers.insert(channel, writer);
         }
@@ -2157,12 +2634,12 @@ impl DeribitCompressedEventWriters {
     }
 }
 
-fn deribit_output_spec(channel: &'static str) -> FeedSpec {
+fn deribit_output_spec(currency: &str, channel: &'static str) -> FeedSpec {
     FeedSpec {
         exchange: "deribit",
-        symbol: "BTC".to_owned(),
+        symbol: currency.to_owned(),
         channel,
-        connection_id: "deribit-BTC-instruments".to_owned(),
+        connection_id: format!("deribit-{currency}-instruments"),
         url: String::new(),
         subscribe_messages: Vec::new(),
         behavior: FeedBehavior::Static,
@@ -2179,15 +2656,17 @@ struct HyperliquidCompressedEventWriters {
     output_dir: PathBuf,
     symbol: String,
     zstd_level: i32,
+    frame_events: usize,
     writers: HashMap<&'static str, DailyCompressedEventWriter>,
 }
 
 impl HyperliquidCompressedEventWriters {
-    fn create(output_dir: &Path, symbol: &str, zstd_level: i32) -> Self {
+    fn create(output_dir: &Path, symbol: &str, zstd_level: i32, frame_events: usize) -> Self {
         Self {
             output_dir: output_dir.to_path_buf(),
             symbol: symbol.to_owned(),
             zstd_level,
+            frame_events,
             writers: HashMap::new(),
         }
     }
@@ -2213,6 +2692,7 @@ impl HyperliquidCompressedEventWriters {
                 &self.symbol,
                 channel,
                 self.zstd_level,
+                self.frame_events,
             )?;
             self.writers.insert(channel, writer);
         }
@@ -2255,794 +2735,6 @@ struct RawWsEvent<'a> {
     payload_text: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     payload_base64: Option<&'a str>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawWsEventOwned {
-    received_at: String,
-    received_mts: i64,
-    exchange: String,
-    symbol: String,
-    channel: String,
-    connection_id: String,
-    payload_text: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct DeribitInstrumentMeta {
-    instrument_name: String,
-    kind: Option<String>,
-    state: Option<String>,
-    base_currency: Option<String>,
-    quote_currency: Option<String>,
-    settlement_currency: Option<String>,
-    counter_currency: Option<String>,
-    instrument_type: Option<String>,
-    future_type: Option<String>,
-    settlement_period: Option<String>,
-    option_type: Option<String>,
-    price_index: Option<String>,
-    strike: Option<String>,
-    contract_size: Option<String>,
-    tick_size: Option<String>,
-    expiration_timestamp: Option<i64>,
-    creation_timestamp: Option<i64>,
-    instrument_id: Option<i64>,
-    is_active: Option<bool>,
-}
-
-#[derive(Debug)]
-struct DeribitQuoteRow {
-    exchange: String,
-    symbol: String,
-    received_at: String,
-    received_mts: i64,
-    connection_id: String,
-    subscription_channel: String,
-    instrument_name: String,
-    kind: Option<String>,
-    expiration_timestamp: Option<i64>,
-    strike: Option<String>,
-    option_type: Option<String>,
-    settlement_period: Option<String>,
-    ticker_timestamp: Option<i64>,
-    ticker_type: Option<String>,
-    state: Option<String>,
-    best_bid_price: Option<String>,
-    best_bid_amount: Option<String>,
-    best_ask_price: Option<String>,
-    best_ask_amount: Option<String>,
-    index_price: Option<String>,
-    mark_price: Option<String>,
-    last_price: Option<String>,
-    underlying_price: Option<String>,
-    underlying_index: Option<String>,
-    open_interest: Option<String>,
-    settlement_price: Option<String>,
-    estimated_delivery_price: Option<String>,
-    min_price: Option<String>,
-    max_price: Option<String>,
-    bid_iv: Option<String>,
-    ask_iv: Option<String>,
-    mark_iv: Option<String>,
-    funding_8h: Option<String>,
-    current_funding: Option<String>,
-    stats_volume: Option<String>,
-    stats_volume_usd: Option<String>,
-    stats_volume_notional: Option<String>,
-    stats_high: Option<String>,
-    stats_low: Option<String>,
-    stats_price_change: Option<String>,
-    delta: Option<String>,
-    gamma: Option<String>,
-    theta: Option<String>,
-    vega: Option<String>,
-    rho: Option<String>,
-}
-
-#[derive(Debug)]
-struct DeribitTradeRow {
-    exchange: String,
-    symbol: String,
-    received_at: String,
-    received_mts: i64,
-    connection_id: String,
-    subscription_channel: String,
-    instrument_name: String,
-    kind: Option<String>,
-    expiration_timestamp: Option<i64>,
-    strike: Option<String>,
-    option_type: Option<String>,
-    settlement_period: Option<String>,
-    trade_timestamp: Option<i64>,
-    trade_id: Option<String>,
-    trade_seq: Option<i64>,
-    direction: Option<String>,
-    tick_direction: Option<i64>,
-    price: Option<String>,
-    amount: Option<String>,
-    contracts: Option<String>,
-    mark_price: Option<String>,
-    index_price: Option<String>,
-    iv: Option<String>,
-    liquidation: Option<String>,
-    block_trade_id: Option<String>,
-    combo_id: Option<String>,
-    combo_trade_id: Option<String>,
-    block_rfq_id: Option<i64>,
-}
-
-#[derive(Debug)]
-struct NormalizeSummary {
-    output_dir: PathBuf,
-    instrument_count: usize,
-    quote_count: usize,
-    trade_count: usize,
-}
-
-fn run_normalize_command(args: &NormalizeArgs) -> Result<()> {
-    let summary = normalize_deribit_day(args)?;
-    eprintln!(
-        "normalized Deribit BTC {}: {} instruments, {} ticker rows, {} trade rows",
-        args.date, summary.instrument_count, summary.quote_count, summary.trade_count
-    );
-    eprintln!(
-        "wrote normalized Parquet under {}",
-        summary.output_dir.display()
-    );
-    Ok(())
-}
-
-fn normalize_deribit_day(args: &NormalizeArgs) -> Result<NormalizeSummary> {
-    let source_files = deribit_raw_files(&args.input_dir, args.date)?;
-    if !source_files.iter().any(|path| path.exists()) {
-        bail!(
-            "no Deribit BTC raw files found for {} under {}",
-            args.date,
-            args.input_dir.display()
-        );
-    }
-
-    let instruments = collect_deribit_instruments(&args.input_dir, args.date)?;
-    let quotes = collect_deribit_quotes(&args.input_dir, args.date, &instruments)?;
-    let trades = collect_deribit_trades(&args.input_dir, args.date, &instruments)?;
-
-    let output_dir = args.output_dir.join("deribit").join("btc");
-    let mut instrument_rows = instruments.into_values().collect::<Vec<_>>();
-    instrument_rows.sort_by(|left, right| left.instrument_name.cmp(&right.instrument_name));
-
-    write_deribit_instruments_parquet(
-        &normalized_parquet_path(&output_dir, "instruments", args.date),
-        &instrument_rows,
-    )?;
-    write_deribit_quotes_parquet(
-        &normalized_parquet_path(&output_dir, "incremental_ticker", args.date),
-        &quotes,
-    )?;
-    write_deribit_trades_parquet(
-        &normalized_parquet_path(&output_dir, "trades", args.date),
-        &trades,
-    )?;
-
-    Ok(NormalizeSummary {
-        output_dir,
-        instrument_count: instrument_rows.len(),
-        quote_count: quotes.len(),
-        trade_count: trades.len(),
-    })
-}
-
-fn collect_deribit_instruments(
-    input_dir: &Path,
-    date: NaiveDate,
-) -> Result<HashMap<String, DeribitInstrumentMeta>> {
-    let mut instruments = HashMap::new();
-
-    let control_path = deribit_raw_file_path(input_dir, "control", date)?;
-    for_each_raw_text_event(&control_path, |_, text| {
-        let message =
-            serde_json::from_str::<Value>(text).context("invalid Deribit control JSON")?;
-        if let Some(rows) = message.get("result").and_then(Value::as_array) {
-            for row in rows {
-                if let Some(meta) = deribit_instrument_meta_from_value(row) {
-                    instruments.insert(meta.instrument_name.clone(), meta);
-                }
-            }
-        }
-        Ok(())
-    })?;
-
-    let creation_path = deribit_raw_file_path(input_dir, "instrument_creation", date)?;
-    for_each_raw_text_event(&creation_path, |_, text| {
-        let message =
-            serde_json::from_str::<Value>(text).context("invalid Deribit creation JSON")?;
-        if let Some(meta) =
-            deribit_message_data(&message).and_then(deribit_instrument_meta_from_value)
-        {
-            instruments.insert(meta.instrument_name.clone(), meta);
-        }
-        Ok(())
-    })?;
-
-    Ok(instruments)
-}
-
-fn collect_deribit_quotes(
-    input_dir: &Path,
-    date: NaiveDate,
-    instruments: &HashMap<String, DeribitInstrumentMeta>,
-) -> Result<Vec<DeribitQuoteRow>> {
-    let mut rows = Vec::new();
-    let path = deribit_raw_file_path(input_dir, "incremental_ticker", date)?;
-    for_each_raw_text_event(&path, |event, text| {
-        let message = serde_json::from_str::<Value>(text).context("invalid Deribit ticker JSON")?;
-        if let Some(row) = deribit_quote_row_from_message(&event, &message, instruments) {
-            rows.push(row);
-        }
-        Ok(())
-    })?;
-    Ok(rows)
-}
-
-fn collect_deribit_trades(
-    input_dir: &Path,
-    date: NaiveDate,
-    instruments: &HashMap<String, DeribitInstrumentMeta>,
-) -> Result<Vec<DeribitTradeRow>> {
-    let mut rows = Vec::new();
-    let path = deribit_raw_file_path(input_dir, "trades", date)?;
-    for_each_raw_text_event(&path, |event, text| {
-        let message = serde_json::from_str::<Value>(text).context("invalid Deribit trades JSON")?;
-        rows.extend(deribit_trade_rows_from_message(
-            &event,
-            &message,
-            instruments,
-        ));
-        Ok(())
-    })?;
-    Ok(rows)
-}
-
-fn deribit_instrument_meta_from_value(value: &Value) -> Option<DeribitInstrumentMeta> {
-    let instrument_name = value.get("instrument_name")?.as_str()?.to_owned();
-    Some(DeribitInstrumentMeta {
-        instrument_name,
-        kind: json_field_string(value, "kind"),
-        state: json_field_string(value, "state"),
-        base_currency: json_field_string(value, "base_currency"),
-        quote_currency: json_field_string(value, "quote_currency"),
-        settlement_currency: json_field_string(value, "settlement_currency"),
-        counter_currency: json_field_string(value, "counter_currency"),
-        instrument_type: json_field_string(value, "instrument_type"),
-        future_type: json_field_string(value, "future_type"),
-        settlement_period: json_field_string(value, "settlement_period"),
-        option_type: json_field_string(value, "option_type"),
-        price_index: json_field_string(value, "price_index"),
-        strike: json_field_string(value, "strike"),
-        contract_size: json_field_string(value, "contract_size"),
-        tick_size: json_field_string(value, "tick_size"),
-        expiration_timestamp: json_field_i64(value, "expiration_timestamp"),
-        creation_timestamp: json_field_i64(value, "creation_timestamp"),
-        instrument_id: json_field_i64(value, "instrument_id"),
-        is_active: value.get("is_active").and_then(Value::as_bool),
-    })
-}
-
-fn deribit_quote_row_from_message(
-    event: &RawWsEventOwned,
-    message: &Value,
-    instruments: &HashMap<String, DeribitInstrumentMeta>,
-) -> Option<DeribitQuoteRow> {
-    let data = deribit_message_data(message)?;
-    let instrument_name = data.get("instrument_name")?.as_str()?.to_owned();
-    let meta = instruments.get(&instrument_name);
-
-    Some(DeribitQuoteRow {
-        exchange: event.exchange.clone(),
-        symbol: event.symbol.clone(),
-        received_at: event.received_at.clone(),
-        received_mts: event.received_mts,
-        connection_id: event.connection_id.clone(),
-        subscription_channel: deribit_message_channel(message)
-            .unwrap_or(&event.channel)
-            .to_owned(),
-        instrument_name,
-        kind: meta_string(meta, |meta| &meta.kind),
-        expiration_timestamp: meta.and_then(|meta| meta.expiration_timestamp),
-        strike: meta_string(meta, |meta| &meta.strike),
-        option_type: meta_string(meta, |meta| &meta.option_type),
-        settlement_period: meta_string(meta, |meta| &meta.settlement_period),
-        ticker_timestamp: json_field_i64(data, "timestamp"),
-        ticker_type: json_field_string(data, "type"),
-        state: json_field_string(data, "state"),
-        best_bid_price: json_field_string(data, "best_bid_price"),
-        best_bid_amount: json_field_string(data, "best_bid_amount"),
-        best_ask_price: json_field_string(data, "best_ask_price"),
-        best_ask_amount: json_field_string(data, "best_ask_amount"),
-        index_price: json_field_string(data, "index_price"),
-        mark_price: json_field_string(data, "mark_price"),
-        last_price: json_field_string(data, "last_price"),
-        underlying_price: json_field_string(data, "underlying_price"),
-        underlying_index: json_field_string(data, "underlying_index"),
-        open_interest: json_field_string(data, "open_interest"),
-        settlement_price: json_field_string(data, "settlement_price"),
-        estimated_delivery_price: json_field_string(data, "estimated_delivery_price"),
-        min_price: json_field_string(data, "min_price"),
-        max_price: json_field_string(data, "max_price"),
-        bid_iv: json_field_string(data, "bid_iv"),
-        ask_iv: json_field_string(data, "ask_iv"),
-        mark_iv: json_field_string(data, "mark_iv"),
-        funding_8h: json_field_string(data, "funding_8h"),
-        current_funding: json_field_string(data, "current_funding"),
-        stats_volume: json_pointer_string(data, "/stats/volume"),
-        stats_volume_usd: json_pointer_string(data, "/stats/volume_usd"),
-        stats_volume_notional: json_pointer_string(data, "/stats/volume_notional"),
-        stats_high: json_pointer_string(data, "/stats/high"),
-        stats_low: json_pointer_string(data, "/stats/low"),
-        stats_price_change: json_pointer_string(data, "/stats/price_change"),
-        delta: json_pointer_string(data, "/greeks/delta"),
-        gamma: json_pointer_string(data, "/greeks/gamma"),
-        theta: json_pointer_string(data, "/greeks/theta"),
-        vega: json_pointer_string(data, "/greeks/vega"),
-        rho: json_pointer_string(data, "/greeks/rho"),
-    })
-}
-
-fn deribit_trade_rows_from_message(
-    event: &RawWsEventOwned,
-    message: &Value,
-    instruments: &HashMap<String, DeribitInstrumentMeta>,
-) -> Vec<DeribitTradeRow> {
-    let Some(data) = deribit_message_data(message) else {
-        return Vec::new();
-    };
-
-    match data {
-        Value::Array(trades) => trades
-            .iter()
-            .filter_map(|trade| deribit_trade_row_from_value(event, message, trade, instruments))
-            .collect(),
-        Value::Object(_) => deribit_trade_row_from_value(event, message, data, instruments)
-            .into_iter()
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn deribit_trade_row_from_value(
-    event: &RawWsEventOwned,
-    message: &Value,
-    trade: &Value,
-    instruments: &HashMap<String, DeribitInstrumentMeta>,
-) -> Option<DeribitTradeRow> {
-    let instrument_name = trade.get("instrument_name")?.as_str()?.to_owned();
-    let meta = instruments.get(&instrument_name);
-
-    Some(DeribitTradeRow {
-        exchange: event.exchange.clone(),
-        symbol: event.symbol.clone(),
-        received_at: event.received_at.clone(),
-        received_mts: event.received_mts,
-        connection_id: event.connection_id.clone(),
-        subscription_channel: deribit_message_channel(message)
-            .unwrap_or(&event.channel)
-            .to_owned(),
-        instrument_name,
-        kind: meta_string(meta, |meta| &meta.kind),
-        expiration_timestamp: meta.and_then(|meta| meta.expiration_timestamp),
-        strike: meta_string(meta, |meta| &meta.strike),
-        option_type: meta_string(meta, |meta| &meta.option_type),
-        settlement_period: meta_string(meta, |meta| &meta.settlement_period),
-        trade_timestamp: json_field_i64(trade, "timestamp"),
-        trade_id: json_field_string(trade, "trade_id"),
-        trade_seq: json_field_i64(trade, "trade_seq"),
-        direction: json_field_string(trade, "direction"),
-        tick_direction: json_field_i64(trade, "tick_direction"),
-        price: json_field_string(trade, "price"),
-        amount: json_field_string(trade, "amount"),
-        contracts: json_field_string(trade, "contracts"),
-        mark_price: json_field_string(trade, "mark_price"),
-        index_price: json_field_string(trade, "index_price"),
-        iv: json_field_string(trade, "iv"),
-        liquidation: json_field_string(trade, "liquidation"),
-        block_trade_id: json_field_string(trade, "block_trade_id"),
-        combo_id: json_field_string(trade, "combo_id"),
-        combo_trade_id: json_field_string(trade, "combo_trade_id"),
-        block_rfq_id: json_field_i64(trade, "block_rfq_id"),
-    })
-}
-
-fn meta_string(
-    meta: Option<&DeribitInstrumentMeta>,
-    field: fn(&DeribitInstrumentMeta) -> &Option<String>,
-) -> Option<String> {
-    meta.and_then(|meta| field(meta).clone())
-}
-
-fn json_field_i64(value: &Value, field: &str) -> Option<i64> {
-    json_value_i64(value.get(field)?)
-}
-
-fn json_value_i64(value: &Value) -> Option<i64> {
-    value.as_i64().or_else(|| {
-        value
-            .as_u64()
-            .and_then(|unsigned| i64::try_from(unsigned).ok())
-    })
-}
-
-fn json_field_string(value: &Value, field: &str) -> Option<String> {
-    json_value_string(value.get(field)?)
-}
-
-fn json_pointer_string(value: &Value, pointer: &str) -> Option<String> {
-    json_value_string(value.pointer(pointer)?)
-}
-
-fn json_value_string(value: &Value) -> Option<String> {
-    match value {
-        Value::Null | Value::Array(_) | Value::Object(_) => None,
-        Value::Bool(value) => Some(value.to_string()),
-        Value::Number(value) => Some(value.to_string()),
-        Value::String(value) => Some(value.clone()),
-    }
-}
-
-fn deribit_raw_files(input_dir: &Path, date: NaiveDate) -> Result<Vec<PathBuf>> {
-    [
-        "control",
-        "instrument_creation",
-        "incremental_ticker",
-        "trades",
-    ]
-    .into_iter()
-    .map(|channel| deribit_raw_file_path(input_dir, channel, date))
-    .collect()
-}
-
-fn deribit_raw_file_path(input_dir: &Path, channel: &str, date: NaiveDate) -> Result<PathBuf> {
-    let symbol_name = symbol_partition_name("BTC")?;
-    let channel_name = symbol_partition_name(channel)?;
-    Ok(daily_stream_file_path(
-        &input_dir
-            .join("deribit")
-            .join(&symbol_name)
-            .join(&channel_name),
-        &symbol_name,
-        &channel_name,
-        date,
-    ))
-}
-
-fn for_each_raw_text_event<F>(path: &Path, mut handle: F) -> Result<usize>
-where
-    F: FnMut(RawWsEventOwned, &str) -> Result<()>,
-{
-    if !path.exists() {
-        return Ok(0);
-    }
-
-    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let decoder = zstd::stream::read::Decoder::new(file)
-        .with_context(|| format!("failed to create zstd decoder for {}", path.display()))?;
-    let reader = BufReader::new(decoder);
-    let mut count = 0_usize;
-
-    for (line_index, line) in reader.lines().enumerate() {
-        let line_number = line_index + 1;
-        let line = match line {
-            Ok(line) => line,
-            Err(error) if is_incomplete_zstd_frame(&error) => {
-                eprintln!(
-                    "stopped reading {} at line {line_number}: incomplete zstd tail",
-                    path.display()
-                );
-                break;
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("failed to read {} line {line_number}", path.display())
-                });
-            }
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let mut event = serde_json::from_str::<RawWsEventOwned>(&line).with_context(|| {
-            format!(
-                "invalid raw websocket envelope at {}:{line_number}",
-                path.display()
-            )
-        })?;
-        if let Some(text) = event.payload_text.take() {
-            handle(event, &text)
-                .with_context(|| format!("failed to normalize {}:{line_number}", path.display()))?;
-            count = count.saturating_add(1);
-        }
-    }
-
-    Ok(count)
-}
-
-fn is_incomplete_zstd_frame(error: &std::io::Error) -> bool {
-    error.kind() == std::io::ErrorKind::UnexpectedEof
-        || error.to_string().contains("incomplete frame")
-}
-
-fn write_deribit_instruments_parquet(path: &Path, rows: &[DeribitInstrumentMeta]) -> Result<()> {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("exchange", DataType::Utf8, false),
-        Field::new("symbol", DataType::Utf8, false),
-        Field::new("instrument_name", DataType::Utf8, false),
-        Field::new("kind", DataType::Utf8, true),
-        Field::new("state", DataType::Utf8, true),
-        Field::new("base_currency", DataType::Utf8, true),
-        Field::new("quote_currency", DataType::Utf8, true),
-        Field::new("settlement_currency", DataType::Utf8, true),
-        Field::new("counter_currency", DataType::Utf8, true),
-        Field::new("instrument_type", DataType::Utf8, true),
-        Field::new("future_type", DataType::Utf8, true),
-        Field::new("settlement_period", DataType::Utf8, true),
-        Field::new("option_type", DataType::Utf8, true),
-        Field::new("price_index", DataType::Utf8, true),
-        Field::new("strike", DataType::Utf8, true),
-        Field::new("contract_size", DataType::Utf8, true),
-        Field::new("tick_size", DataType::Utf8, true),
-        Field::new("expiration_timestamp", DataType::Int64, true),
-        Field::new("creation_timestamp", DataType::Int64, true),
-        Field::new("instrument_id", DataType::Int64, true),
-        Field::new("is_active", DataType::Boolean, true),
-    ]));
-
-    write_parquet_batch(
-        path,
-        schema,
-        vec![
-            required_string_array(rows.iter().map(|_| "deribit")),
-            required_string_array(rows.iter().map(|_| "BTC")),
-            required_string_array(rows.iter().map(|row| row.instrument_name.as_str())),
-            optional_string_array(rows.iter().map(|row| row.kind.as_deref())),
-            optional_string_array(rows.iter().map(|row| row.state.as_deref())),
-            optional_string_array(rows.iter().map(|row| row.base_currency.as_deref())),
-            optional_string_array(rows.iter().map(|row| row.quote_currency.as_deref())),
-            optional_string_array(rows.iter().map(|row| row.settlement_currency.as_deref())),
-            optional_string_array(rows.iter().map(|row| row.counter_currency.as_deref())),
-            optional_string_array(rows.iter().map(|row| row.instrument_type.as_deref())),
-            optional_string_array(rows.iter().map(|row| row.future_type.as_deref())),
-            optional_string_array(rows.iter().map(|row| row.settlement_period.as_deref())),
-            optional_string_array(rows.iter().map(|row| row.option_type.as_deref())),
-            optional_string_array(rows.iter().map(|row| row.price_index.as_deref())),
-            optional_string_array(rows.iter().map(|row| row.strike.as_deref())),
-            optional_string_array(rows.iter().map(|row| row.contract_size.as_deref())),
-            optional_string_array(rows.iter().map(|row| row.tick_size.as_deref())),
-            optional_i64_array(rows.iter().map(|row| row.expiration_timestamp)),
-            optional_i64_array(rows.iter().map(|row| row.creation_timestamp)),
-            optional_i64_array(rows.iter().map(|row| row.instrument_id)),
-            optional_bool_array(rows.iter().map(|row| row.is_active)),
-        ],
-    )
-}
-
-fn write_deribit_quotes_parquet(path: &Path, rows: &[DeribitQuoteRow]) -> Result<()> {
-    write_parquet_batch(path, deribit_quote_schema(), deribit_quote_columns(rows))
-}
-
-fn deribit_quote_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("exchange", DataType::Utf8, false),
-        Field::new("symbol", DataType::Utf8, false),
-        Field::new("received_at", DataType::Utf8, false),
-        Field::new("received_mts", DataType::Int64, false),
-        Field::new("connection_id", DataType::Utf8, false),
-        Field::new("subscription_channel", DataType::Utf8, false),
-        Field::new("instrument_name", DataType::Utf8, false),
-        Field::new("kind", DataType::Utf8, true),
-        Field::new("expiration_timestamp", DataType::Int64, true),
-        Field::new("strike", DataType::Utf8, true),
-        Field::new("option_type", DataType::Utf8, true),
-        Field::new("settlement_period", DataType::Utf8, true),
-        Field::new("ticker_timestamp", DataType::Int64, true),
-        Field::new("ticker_type", DataType::Utf8, true),
-        Field::new("state", DataType::Utf8, true),
-        Field::new("best_bid_price", DataType::Utf8, true),
-        Field::new("best_bid_amount", DataType::Utf8, true),
-        Field::new("best_ask_price", DataType::Utf8, true),
-        Field::new("best_ask_amount", DataType::Utf8, true),
-        Field::new("index_price", DataType::Utf8, true),
-        Field::new("mark_price", DataType::Utf8, true),
-        Field::new("last_price", DataType::Utf8, true),
-        Field::new("underlying_price", DataType::Utf8, true),
-        Field::new("underlying_index", DataType::Utf8, true),
-        Field::new("open_interest", DataType::Utf8, true),
-        Field::new("settlement_price", DataType::Utf8, true),
-        Field::new("estimated_delivery_price", DataType::Utf8, true),
-        Field::new("min_price", DataType::Utf8, true),
-        Field::new("max_price", DataType::Utf8, true),
-        Field::new("bid_iv", DataType::Utf8, true),
-        Field::new("ask_iv", DataType::Utf8, true),
-        Field::new("mark_iv", DataType::Utf8, true),
-        Field::new("funding_8h", DataType::Utf8, true),
-        Field::new("current_funding", DataType::Utf8, true),
-        Field::new("stats_volume", DataType::Utf8, true),
-        Field::new("stats_volume_usd", DataType::Utf8, true),
-        Field::new("stats_volume_notional", DataType::Utf8, true),
-        Field::new("stats_high", DataType::Utf8, true),
-        Field::new("stats_low", DataType::Utf8, true),
-        Field::new("stats_price_change", DataType::Utf8, true),
-        Field::new("delta", DataType::Utf8, true),
-        Field::new("gamma", DataType::Utf8, true),
-        Field::new("theta", DataType::Utf8, true),
-        Field::new("vega", DataType::Utf8, true),
-        Field::new("rho", DataType::Utf8, true),
-    ]))
-}
-
-fn deribit_quote_columns(rows: &[DeribitQuoteRow]) -> Vec<ArrayRef> {
-    vec![
-        required_string_array(rows.iter().map(|row| row.exchange.as_str())),
-        required_string_array(rows.iter().map(|row| row.symbol.as_str())),
-        required_string_array(rows.iter().map(|row| row.received_at.as_str())),
-        required_i64_array(rows.iter().map(|row| row.received_mts)),
-        required_string_array(rows.iter().map(|row| row.connection_id.as_str())),
-        required_string_array(rows.iter().map(|row| row.subscription_channel.as_str())),
-        required_string_array(rows.iter().map(|row| row.instrument_name.as_str())),
-        optional_string_array(rows.iter().map(|row| row.kind.as_deref())),
-        optional_i64_array(rows.iter().map(|row| row.expiration_timestamp)),
-        optional_string_array(rows.iter().map(|row| row.strike.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.option_type.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.settlement_period.as_deref())),
-        optional_i64_array(rows.iter().map(|row| row.ticker_timestamp)),
-        optional_string_array(rows.iter().map(|row| row.ticker_type.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.state.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.best_bid_price.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.best_bid_amount.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.best_ask_price.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.best_ask_amount.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.index_price.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.mark_price.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.last_price.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.underlying_price.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.underlying_index.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.open_interest.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.settlement_price.as_deref())),
-        optional_string_array(
-            rows.iter()
-                .map(|row| row.estimated_delivery_price.as_deref()),
-        ),
-        optional_string_array(rows.iter().map(|row| row.min_price.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.max_price.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.bid_iv.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.ask_iv.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.mark_iv.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.funding_8h.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.current_funding.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.stats_volume.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.stats_volume_usd.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.stats_volume_notional.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.stats_high.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.stats_low.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.stats_price_change.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.delta.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.gamma.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.theta.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.vega.as_deref())),
-        optional_string_array(rows.iter().map(|row| row.rho.as_deref())),
-    ]
-}
-
-fn write_deribit_trades_parquet(path: &Path, rows: &[DeribitTradeRow]) -> Result<()> {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("exchange", DataType::Utf8, false),
-        Field::new("symbol", DataType::Utf8, false),
-        Field::new("received_at", DataType::Utf8, false),
-        Field::new("received_mts", DataType::Int64, false),
-        Field::new("connection_id", DataType::Utf8, false),
-        Field::new("subscription_channel", DataType::Utf8, false),
-        Field::new("instrument_name", DataType::Utf8, false),
-        Field::new("kind", DataType::Utf8, true),
-        Field::new("expiration_timestamp", DataType::Int64, true),
-        Field::new("strike", DataType::Utf8, true),
-        Field::new("option_type", DataType::Utf8, true),
-        Field::new("settlement_period", DataType::Utf8, true),
-        Field::new("trade_timestamp", DataType::Int64, true),
-        Field::new("trade_id", DataType::Utf8, true),
-        Field::new("trade_seq", DataType::Int64, true),
-        Field::new("direction", DataType::Utf8, true),
-        Field::new("tick_direction", DataType::Int64, true),
-        Field::new("price", DataType::Utf8, true),
-        Field::new("amount", DataType::Utf8, true),
-        Field::new("contracts", DataType::Utf8, true),
-        Field::new("mark_price", DataType::Utf8, true),
-        Field::new("index_price", DataType::Utf8, true),
-        Field::new("iv", DataType::Utf8, true),
-        Field::new("liquidation", DataType::Utf8, true),
-        Field::new("block_trade_id", DataType::Utf8, true),
-        Field::new("combo_id", DataType::Utf8, true),
-        Field::new("combo_trade_id", DataType::Utf8, true),
-        Field::new("block_rfq_id", DataType::Int64, true),
-    ]));
-
-    write_parquet_batch(
-        path,
-        schema,
-        vec![
-            required_string_array(rows.iter().map(|row| row.exchange.as_str())),
-            required_string_array(rows.iter().map(|row| row.symbol.as_str())),
-            required_string_array(rows.iter().map(|row| row.received_at.as_str())),
-            required_i64_array(rows.iter().map(|row| row.received_mts)),
-            required_string_array(rows.iter().map(|row| row.connection_id.as_str())),
-            required_string_array(rows.iter().map(|row| row.subscription_channel.as_str())),
-            required_string_array(rows.iter().map(|row| row.instrument_name.as_str())),
-            optional_string_array(rows.iter().map(|row| row.kind.as_deref())),
-            optional_i64_array(rows.iter().map(|row| row.expiration_timestamp)),
-            optional_string_array(rows.iter().map(|row| row.strike.as_deref())),
-            optional_string_array(rows.iter().map(|row| row.option_type.as_deref())),
-            optional_string_array(rows.iter().map(|row| row.settlement_period.as_deref())),
-            optional_i64_array(rows.iter().map(|row| row.trade_timestamp)),
-            optional_string_array(rows.iter().map(|row| row.trade_id.as_deref())),
-            optional_i64_array(rows.iter().map(|row| row.trade_seq)),
-            optional_string_array(rows.iter().map(|row| row.direction.as_deref())),
-            optional_i64_array(rows.iter().map(|row| row.tick_direction)),
-            optional_string_array(rows.iter().map(|row| row.price.as_deref())),
-            optional_string_array(rows.iter().map(|row| row.amount.as_deref())),
-            optional_string_array(rows.iter().map(|row| row.contracts.as_deref())),
-            optional_string_array(rows.iter().map(|row| row.mark_price.as_deref())),
-            optional_string_array(rows.iter().map(|row| row.index_price.as_deref())),
-            optional_string_array(rows.iter().map(|row| row.iv.as_deref())),
-            optional_string_array(rows.iter().map(|row| row.liquidation.as_deref())),
-            optional_string_array(rows.iter().map(|row| row.block_trade_id.as_deref())),
-            optional_string_array(rows.iter().map(|row| row.combo_id.as_deref())),
-            optional_string_array(rows.iter().map(|row| row.combo_trade_id.as_deref())),
-            optional_i64_array(rows.iter().map(|row| row.block_rfq_id)),
-        ],
-    )
-}
-
-fn write_parquet_batch(path: &Path, schema: Arc<Schema>, columns: Vec<ArrayRef>) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-
-    let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
-        .context("failed to build normalized Arrow batch")?;
-    let file =
-        File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
-    let properties = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(
-            ZstdLevel::try_new(3).context("invalid zstd compression level")?,
-        ))
-        .build();
-    let mut writer = ArrowWriter::try_new(file, schema, Some(properties))
-        .context("failed to create normalized Parquet writer")?;
-    writer
-        .write(&batch)
-        .context("failed to write normalized Parquet batch")?;
-    writer
-        .close()
-        .context("failed to close normalized Parquet writer")?;
-    Ok(())
-}
-
-fn required_string_array<'a>(values: impl Iterator<Item = &'a str>) -> ArrayRef {
-    Arc::new(StringArray::from_iter_values(values))
-}
-
-fn optional_string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
-    Arc::new(values.collect::<StringArray>())
-}
-
-fn required_i64_array(values: impl Iterator<Item = i64>) -> ArrayRef {
-    Arc::new(Int64Array::from_iter_values(values))
-}
-
-fn optional_i64_array(values: impl Iterator<Item = Option<i64>>) -> ArrayRef {
-    Arc::new(values.collect::<Int64Array>())
-}
-
-fn optional_bool_array(values: impl Iterator<Item = Option<bool>>) -> ArrayRef {
-    Arc::new(values.collect::<BooleanArray>())
 }
 
 fn resolve_start(cli_start: Option<i64>, checkpoint: Option<&Checkpoint>) -> Option<i64> {
@@ -3602,14 +3294,6 @@ fn daily_stream_file_path(
     ))
 }
 
-fn normalized_parquet_path(output_dir: &Path, dataset: &str, date: NaiveDate) -> PathBuf {
-    output_dir.join(dataset).join(format!(
-        "btc_{}_{}.parquet",
-        dataset,
-        date.format("%y-%m-%d")
-    ))
-}
-
 fn parse_mts(value: &str) -> Result<i64, String> {
     if value.chars().all(|char| char.is_ascii_digit()) {
         return value
@@ -3690,38 +3374,6 @@ mod tests {
 
     fn test_date() -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 6, 29).expect("valid test date")
-    }
-
-    fn sample_raw_event(channel: &str, payload_text: &str) -> Value {
-        serde_json::json!({
-            "received_at": "2026-06-29T22:17:08.192Z",
-            "received_mts": 1_782_771_428_192_i64,
-            "exchange": "deribit",
-            "symbol": "BTC",
-            "channel": channel,
-            "connection_id": "deribit-BTC-instruments",
-            "payload_text": payload_text
-        })
-    }
-
-    fn write_raw_zstd_file(path: &Path, events: &[Value]) -> Result<()> {
-        std::fs::create_dir_all(path.parent().expect("raw path has parent"))?;
-        let file = std::fs::File::create(path)?;
-        let mut encoder = zstd::stream::write::Encoder::new(BufWriter::new(file), 1)?;
-        for event in events {
-            serde_json::to_writer(&mut encoder, event)?;
-            encoder.write_all(b"\n")?;
-        }
-        encoder.finish()?;
-        Ok(())
-    }
-
-    fn parquet_num_rows(path: &Path) -> Result<i64> {
-        use parquet::file::reader::{FileReader, SerializedFileReader};
-
-        let file = std::fs::File::open(path)?;
-        let reader = SerializedFileReader::new(file)?;
-        Ok(reader.metadata().file_metadata().num_rows())
     }
 
     #[test]
@@ -3882,15 +3534,21 @@ mod tests {
             hibachi_symbol: DEFAULT_HIBACHI_SYMBOL.to_owned(),
             hibachi_url: DEFAULT_HIBACHI_MARKET_WS_URL.to_owned(),
             deribit_url: DEFAULT_DERIBIT_WS_URL.to_owned(),
+            deribit_currency: "ETH".to_owned(),
             deribit_kinds: vec![DeribitInstrumentKind::Future, DeribitInstrumentKind::Option],
             deribit_trades_interval: DEFAULT_DERIBIT_TRADES_INTERVAL.to_owned(),
+            deribit_refresh_secs: DEFAULT_DERIBIT_REFRESH_SECS,
             hyperliquid_spot_coin: None,
             zstd_level: 6,
+            zstd_frame_events: DEFAULT_ZSTD_FRAME_EVENTS,
             max_messages: None,
+            progress_every: 0,
             reconnect_delay_secs: 5,
             heartbeat_secs: DEFAULT_WS_HEARTBEAT_SECS,
         });
         assert_eq!(deribit.exchange, "deribit");
+        assert_eq!(deribit.symbol, "ETH");
+        assert_eq!(deribit.connection_id, "deribit-ETH-instruments");
         assert_eq!(deribit.heartbeat_policy, HeartbeatPolicy::BestEffort);
 
         let hyperliquid = hyperliquid_stream_spec();
@@ -3948,41 +3606,43 @@ mod tests {
         let args = btc_stream_args(BtcArgs {
             output_dir: PathBuf::from("/tmp/modl-btc"),
             zstd_level: 6,
+            zstd_frame_events: DEFAULT_ZSTD_FRAME_EVENTS,
             max_messages: Some(1),
             reconnect_delay_secs: 5,
             heartbeat_secs: DEFAULT_WS_HEARTBEAT_SECS,
-            hibachi_url: DEFAULT_HIBACHI_MARKET_WS_URL.to_owned(),
             deribit_url: DEFAULT_DERIBIT_WS_URL.to_owned(),
+            deribit_currency: "BTC".to_owned(),
+            deribit_refresh_secs: DEFAULT_DERIBIT_REFRESH_SECS,
             hyperliquid_spot_coin: None,
+            progress_every: 0,
         });
 
         assert_eq!(
             args.venues,
             vec![
                 StreamVenue::Bitfinex,
-                StreamVenue::Hibachi,
                 StreamVenue::Deribit,
                 StreamVenue::Hyperliquid,
             ]
         );
         assert_eq!(args.output_dir, PathBuf::from("/tmp/modl-btc"));
         assert_eq!(args.extended_spot_market, DEFAULT_EXTENDED_SPOT_MARKET);
-        assert_eq!(stream_specs(&args).len(), 5);
+        assert_eq!(stream_specs(&args).len(), 4);
     }
 
     #[test]
     fn builds_deribit_subscription_channels() {
-        let channels = deribit_lifecycle_channels(&[
-            DeribitInstrumentKind::Future,
-            DeribitInstrumentKind::Option,
-        ]);
+        let channels = deribit_lifecycle_channels(
+            &[DeribitInstrumentKind::Future, DeribitInstrumentKind::Option],
+            "ETH",
+        );
         assert_eq!(
             channels,
             vec![
-                "instrument.creation.future.BTC",
-                "instrument.state.future.BTC",
-                "instrument.creation.option.BTC",
-                "instrument.state.option.BTC",
+                "instrument.creation.future.ETH",
+                "instrument.state.future.ETH",
+                "instrument.creation.option.ETH",
+                "instrument.state.option.ETH",
             ]
         );
 
@@ -4043,8 +3703,11 @@ mod tests {
             }
         });
         assert_eq!(
-            deribit_created_instrument_name(&message, &allowed).as_deref(),
-            Some("BTC-13JAN23-16000-P")
+            deribit_created_instrument_name(&message, &allowed, "BTC"),
+            Some(DeribitCreatedInstrument {
+                instrument_name: "BTC-13JAN23-16000-P".to_owned(),
+                kind: DeribitInstrumentKind::Option,
+            })
         );
 
         let eth_message = serde_json::json!({
@@ -4058,7 +3721,49 @@ mod tests {
             }
         });
         assert_eq!(
-            deribit_created_instrument_name(&eth_message, &allowed),
+            deribit_created_instrument_name(&eth_message, &allowed, "BTC"),
+            None
+        );
+        assert_eq!(
+            deribit_created_instrument_name(&eth_message, &allowed, "ETH"),
+            Some(DeribitCreatedInstrument {
+                instrument_name: "ETH-13JAN23-16000-P".to_owned(),
+                kind: DeribitInstrumentKind::Option,
+            })
+        );
+
+        let inactive = serde_json::json!({
+            "params": {
+                "channel": "instrument.state.future.BTC",
+                "data": {
+                    "state": "inactive",
+                    "instrument_name": "BTC-27JUL26"
+                }
+            }
+        });
+        assert_eq!(
+            deribit_instrument_state_update(&inactive, &allowed, "BTC"),
+            Some(DeribitInstrumentStateUpdate {
+                instrument_name: "BTC-27JUL26".to_owned(),
+                kind: DeribitInstrumentKind::Future,
+                active: false,
+            })
+        );
+
+        let inactive_creation = serde_json::json!({
+            "params": {
+                "channel": "instrument.creation.option.BTC",
+                "data": {
+                    "kind": "option",
+                    "base_currency": "BTC",
+                    "state": "inactive",
+                    "is_active": false,
+                    "instrument_name": "BTC-7AUG26-72000-C"
+                }
+            }
+        });
+        assert_eq!(
+            deribit_created_instrument_name(&inactive_creation, &allowed, "BTC"),
             None
         );
     }
@@ -4104,8 +3809,12 @@ mod tests {
         });
 
         assert_eq!(
-            deribit_instrument_names_from_get_instruments_response(&message, &allowed),
+            deribit_instrument_names_from_get_instruments_response(&message, &allowed, "BTC"),
             vec!["BTC-PERPETUAL", "BTC-13JAN23-16000-P"]
+        );
+        assert_eq!(
+            deribit_instrument_names_from_get_instruments_response(&message, &allowed, "ETH"),
+            vec!["ETH-13JAN23-16000-P"]
         );
         assert_eq!(deribit_response_id(&message), Some(2));
     }
@@ -4150,141 +3859,6 @@ mod tests {
         assert!(!is_expected_websocket_reconnect_error(&WsError::Protocol(
             ProtocolError::MaskedFrameFromServer
         )));
-    }
-
-    #[test]
-    fn normalizes_deribit_quote_and_trade_metadata() {
-        let instrument = serde_json::json!({
-            "instrument_name": "BTC-31JUL26-60000-P",
-            "kind": "option",
-            "base_currency": "BTC",
-            "quote_currency": "BTC",
-            "settlement_currency": "BTC",
-            "expiration_timestamp": 1_785_484_800_000_i64,
-            "creation_timestamp": 1_777_993_440_000_i64,
-            "strike": 60000.0,
-            "option_type": "put",
-            "settlement_period": "month",
-            "is_active": true
-        });
-        let meta = deribit_instrument_meta_from_value(&instrument).expect("instrument metadata");
-        let instruments = HashMap::from([(meta.instrument_name.clone(), meta)]);
-        let event = RawWsEventOwned {
-            received_at: "2026-06-29T22:17:08.192Z".to_owned(),
-            received_mts: 1_782_771_428_192,
-            exchange: "deribit".to_owned(),
-            symbol: "BTC".to_owned(),
-            channel: "incremental_ticker".to_owned(),
-            connection_id: "deribit-BTC-instruments".to_owned(),
-            payload_text: None,
-        };
-
-        let ticker = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "subscription",
-            "params": {
-                "channel": "incremental_ticker.BTC-31JUL26-60000-P",
-                "data": {
-                    "timestamp": 1_782_771_427_066_i64,
-                    "type": "snapshot",
-                    "instrument_name": "BTC-31JUL26-60000-P",
-                    "mark_price": 0.043_449_2,
-                    "stats": {"volume": 5.0, "volume_usd": 300_000.0}
-                }
-            }
-        });
-        let quote =
-            deribit_quote_row_from_message(&event, &ticker, &instruments).expect("ticker row");
-        assert_eq!(quote.kind.as_deref(), Some("option"));
-        assert_eq!(quote.strike.as_deref(), Some("60000.0"));
-        assert_eq!(quote.option_type.as_deref(), Some("put"));
-        assert_eq!(quote.mark_price.as_deref(), Some("0.0434492"));
-        assert_eq!(quote.stats_volume.as_deref(), Some("5.0"));
-
-        let trades = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "subscription",
-            "params": {
-                "channel": "trades.BTC-31JUL26-60000-P.100ms",
-                "data": [{
-                    "timestamp": 1_782_772_067_807_i64,
-                    "iv": 41.51,
-                    "price": 0.044,
-                    "amount": 0.9,
-                    "direction": "buy",
-                    "index_price": 60377.86,
-                    "instrument_name": "BTC-31JUL26-60000-P",
-                    "trade_seq": 2265,
-                    "mark_price": 0.043_449_2,
-                    "tick_direction": 2,
-                    "contracts": 0.9,
-                    "trade_id": "436176324"
-                }]
-            }
-        });
-        let trade_rows = deribit_trade_rows_from_message(&event, &trades, &instruments);
-        assert_eq!(trade_rows.len(), 1);
-        assert_eq!(trade_rows[0].kind.as_deref(), Some("option"));
-        assert_eq!(trade_rows[0].strike.as_deref(), Some("60000.0"));
-        assert_eq!(trade_rows[0].price.as_deref(), Some("0.044"));
-        assert_eq!(trade_rows[0].trade_id.as_deref(), Some("436176324"));
-    }
-
-    #[test]
-    fn writes_deribit_normalized_parquet_files() -> Result<()> {
-        let date = test_date();
-        let dir = temp_test_dir();
-        let input_dir = dir.join("raw");
-        let output_dir = dir.join("normalized");
-
-        let control_payload = r#"{"jsonrpc":"2.0","id":2,"result":[{"instrument_name":"BTC-31JUL26-60000-P","kind":"option","base_currency":"BTC","quote_currency":"BTC","settlement_currency":"BTC","expiration_timestamp":1785484800000,"creation_timestamp":1777993440000,"strike":60000.0,"option_type":"put","settlement_period":"month","is_active":true}]}"#;
-        write_raw_zstd_file(
-            &deribit_raw_file_path(&input_dir, "control", date)?,
-            &[sample_raw_event("control", control_payload)],
-        )?;
-
-        let ticker_payload = r#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"incremental_ticker.BTC-31JUL26-60000-P","data":{"timestamp":1782771427066,"type":"snapshot","instrument_name":"BTC-31JUL26-60000-P","mark_price":0.0434492,"stats":{"volume":5.0}}}}"#;
-        write_raw_zstd_file(
-            &deribit_raw_file_path(&input_dir, "incremental_ticker", date)?,
-            &[sample_raw_event("incremental_ticker", ticker_payload)],
-        )?;
-
-        let trades_payload = r#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"trades.BTC-31JUL26-60000-P.100ms","data":[{"timestamp":1782772067807,"iv":41.51,"price":0.044,"amount":0.9,"direction":"buy","index_price":60377.86,"instrument_name":"BTC-31JUL26-60000-P","trade_seq":2265,"mark_price":0.0434492,"tick_direction":2,"contracts":0.9,"trade_id":"436176324"}]}}"#;
-        write_raw_zstd_file(
-            &deribit_raw_file_path(&input_dir, "trades", date)?,
-            &[sample_raw_event("trades", trades_payload)],
-        )?;
-
-        run_normalize_command(&NormalizeArgs {
-            date,
-            input_dir,
-            output_dir: output_dir.clone(),
-        })?;
-
-        let normalized_dir = output_dir.join("deribit").join("btc");
-        assert_eq!(
-            parquet_num_rows(&normalized_parquet_path(
-                &normalized_dir,
-                "instruments",
-                date
-            ))?,
-            1
-        );
-        assert_eq!(
-            parquet_num_rows(&normalized_parquet_path(
-                &normalized_dir,
-                "incremental_ticker",
-                date
-            ))?,
-            1
-        );
-        assert_eq!(
-            parquet_num_rows(&normalized_parquet_path(&normalized_dir, "trades", date))?,
-            1
-        );
-
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
     }
 
     #[test]
@@ -4356,13 +3930,26 @@ mod tests {
             heartbeat_policy: HeartbeatPolicy::Required,
         };
 
-        let mut writer =
-            DailyCompressedEventWriter::create(&dir, spec.exchange, &spec.symbol, spec.channel, 1)?;
+        let mut writer = DailyCompressedEventWriter::create(
+            &dir,
+            spec.exchange,
+            &spec.symbol,
+            spec.channel,
+            1,
+            1,
+        )?;
         writer.write_text_event(&spec, r#"{"event":"test"}"#)?;
+        writer.write_text_event(&spec, r#"{"event":"rotated"}"#)?;
         writer.close()?;
 
-        let mut writer =
-            DailyCompressedEventWriter::create(&dir, spec.exchange, &spec.symbol, spec.channel, 1)?;
+        let mut writer = DailyCompressedEventWriter::create(
+            &dir,
+            spec.exchange,
+            &spec.symbol,
+            spec.channel,
+            1,
+            1,
+        )?;
         writer.write_text_event(&spec, r#"{"event":"second"}"#)?;
         writer.close()?;
 
@@ -4376,6 +3963,7 @@ mod tests {
         let text = String::from_utf8(decoded).context("event file was not UTF-8")?;
         assert!(text.contains(r#""exchange":"bitfinex""#));
         assert!(text.contains(r#""payload_text":"{\"event\":\"test\"}""#));
+        assert!(text.contains(r#""payload_text":"{\"event\":\"rotated\"}""#));
         assert!(text.contains(r#""payload_text":"{\"event\":\"second\"}""#));
 
         std::fs::remove_dir_all(dir)?;
