@@ -50,11 +50,33 @@ cargo run -- --start 2026-06-14T00:00:00Z --output-dir data
 
 The `stream` subcommand records raw websocket messages first. This keeps the source feed intact while we are still deciding which normalized features to build.
 
-Record the stable BTC websocket venues to daily compressed JSONL under `/mnt/burner-archive/ws_raw`. This shortcut records Bitfinex, Hibachi, Deribit, and Hyperliquid; Extended is excluded because its public orderbook websocket currently drops with server ping timeouts.
+Record the stable BTC websocket venues to daily compressed JSONL under `/mnt/burner-archive/ws_raw`. This shortcut records Bitfinex, Deribit, and Hyperliquid; Hibachi and Extended remain available through `stream --venue` but are not part of the default BTC recorder.
 
 ```sh
 cargo run --release btc
 ```
+
+For the Raspberry Pi recorder workflow, build the release binaries and use the small Rust terminal UI:
+
+```sh
+cargo build --release --bins
+target/release/modl-tui
+```
+
+The TUI lets you turn venues on or off, edit the venue-specific market strings, choose the output directory, and start the recorder. It records all supported data for each selected venue and prints progress lines such as `progress bitfinex-tBTCUSD-trades messages=100` so you can see messages flowing. Press Enter while the recorder is running to send it a clean stop signal and return to the menu.
+
+The equivalent headless command is:
+
+```sh
+target/release/modl stream \
+  --venue bitfinex,deribit,hyperliquid \
+  --output-dir /mnt/burner-archive/ws_raw \
+  --bitfinex-symbol tBTCUSD \
+  --deribit-currency BTC \
+  --progress-every 100
+```
+
+Ticker formats are venue-specific. Use Bitfinex symbols like `tBTCUSD`, Hibachi symbols like `BTC/USDT-P`, Deribit currencies like `BTC` or `ETH`, Extended markets like `BTC-USD`, and `--hyperliquid-spot-coin` only when you want to override the default BTC spot resolution.
 
 When passing extra recorder flags through Cargo, use `--` before the binary arguments:
 
@@ -107,11 +129,12 @@ cargo run --release -- stream \
 
 Override the Hibachi websocket endpoint with `--hibachi-url` or `HIBACHI_WS_URL` if their environment changes.
 
-Record Deribit BTC futures and options. On startup the recorder fetches current BTC futures/options with `public/get_instruments`, subscribes to each instrument's incremental ticker and trade streams, and keeps the lifecycle subscriptions open so newly-created instruments are added automatically:
+Record Deribit futures and options. On startup the recorder fetches current instruments for `--deribit-currency`, subscribes to each instrument's incremental ticker and trade streams, and keeps the lifecycle subscriptions open so newly-created instruments are added automatically:
 
 ```sh
 cargo run --release -- stream \
   --venue deribit \
+  --deribit-currency BTC \
   --deribit-kind future,option \
   --output-dir /mnt/burner-archive/ws_raw
 ```
@@ -131,6 +154,8 @@ cargo run --release -- stream \
 
 Override the Deribit websocket endpoint with `--deribit-url` or `DERIBIT_WS_URL`. Deribit trade follow-up subscriptions use `--deribit-trades-interval 100ms` by default; allowed values are `raw`, `100ms`, and `agg2`. The Deribit recorder enables Deribit's JSON-RPC heartbeat on connect and answers `test_request` messages with `public/test`; websocket protocol pings are best-effort on this feed so delayed pong control frames do not force reconnects while the high-channel market-data stream is still active.
 
+Deribit keeps one websocket open for active futures/options. It subscribes current instruments at startup, subscribes newly-created instruments from lifecycle events, unsubscribes inactive/closed/settled instruments from lifecycle state events, and refreshes the active instrument inventory every 300 seconds on the same websocket. Tune this with `--deribit-refresh-secs`, or set it to `0` to rely only on lifecycle events.
+
 Record Hyperliquid BTC spot trades and order book updates through `hypersdk`. By default the recorder resolves the current BTC spot market from Hyperliquid spot metadata, currently `UBTC/USDC`:
 
 ```sh
@@ -141,7 +166,9 @@ cargo run --release -- stream \
 
 Use `--hyperliquid-spot-coin` to override the SDK subscription coin if needed.
 
-The recorder sends websocket protocol pings every 20 seconds by default. Bitfinex and Hibachi reconnect if a heartbeat pong is not received before the next tick. Extended and Deribit keep websocket protocol pings best-effort: Extended sends its own server pings, and Deribit uses its JSON-RPC heartbeat/test flow. Incoming server ping frames are flushed as pongs immediately. Tune this with `--heartbeat-secs`, or set it to `0` to disable client pings and Deribit's JSON-RPC heartbeat setup.
+The recorder sends websocket protocol pings every 20 seconds by default. Bitfinex and Hibachi reconnect if a heartbeat pong is not received before the next tick. Extended and Deribit keep websocket protocol pings best-effort: Extended sends its own server pings, and Deribit uses its JSON-RPC heartbeat/test flow. Hyperliquid is reconnected if the SDK stream disconnects or ends. Incoming server ping frames are flushed as pongs immediately. Tune this with `--heartbeat-secs`, or set it to `0` to disable client pings and Deribit's JSON-RPC heartbeat setup.
+
+Raw Zstd outputs are append-only daily files made of concatenated Zstd frames. The recorder closes, appends, and syncs the current frame every 50,000 raw events by default, limiting crash or power-loss exposure to the active frame instead of a full-day stream. Tune this with `--zstd-frame-events`.
 
 Use `--max-messages` for a quick smoke test, and `Ctrl+C` to stop a long capture cleanly:
 

@@ -57,10 +57,12 @@ const CHECKPOINT_TMP_FILE: &str = ".checkpoint.json.tmp";
 const CHECKPOINT_VERSION: u8 = 1;
 const DEFAULT_WS_HEARTBEAT_SECS: u64 = 20;
 const DEFAULT_WS_OUTPUT_DIR: &str = "/mnt/burner-archive/ws_raw";
+const DEFAULT_ZSTD_FRAME_EVENTS: usize = 50_000;
 const DEFAULT_EXTENDED_MARKET: &str = "BTC-USD";
 const DEFAULT_EXTENDED_SPOT_MARKET: &str = "BTCSPOT-USD";
 const DEFAULT_HIBACHI_SYMBOL: &str = "BTC/USDT-P";
 const DEFAULT_DERIBIT_TRADES_INTERVAL: &str = "100ms";
+const DEFAULT_DERIBIT_REFRESH_SECS: u64 = 300;
 const DERIBIT_SUBSCRIBE_CHUNK_SIZE: usize = 200;
 const DERIBIT_SUBSCRIBE_CHUNK_DELAY: Duration = Duration::from_millis(250);
 const DEFAULT_DERIBIT_WS_URL: &str = "wss://www.deribit.com/ws/api/v2";
@@ -171,7 +173,11 @@ struct StreamArgs {
     #[arg(long, env = "DERIBIT_WS_URL", default_value = DEFAULT_DERIBIT_WS_URL)]
     deribit_url: String,
 
-    /// Deribit BTC instrument kinds to track. Repeat the flag or pass comma-separated values.
+    /// Deribit currency to track.
+    #[arg(long, default_value = "BTC", value_parser = parse_deribit_currency)]
+    deribit_currency: String,
+
+    /// Deribit instrument kinds to track. Repeat the flag or pass comma-separated values.
     #[arg(
         long = "deribit-kind",
         value_enum,
@@ -192,9 +198,17 @@ struct StreamArgs {
     #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(i32).range(1..=22))]
     zstd_level: i32,
 
+    /// Close, append, and sync the current Zstd frame after this many raw events.
+    #[arg(long, default_value_t = DEFAULT_ZSTD_FRAME_EVENTS, value_parser = parse_positive_usize)]
+    zstd_frame_events: usize,
+
     /// Stop each feed after this many data messages. Mostly useful for smoke tests.
     #[arg(long)]
     max_messages: Option<usize>,
+
+    /// Print one progress line after this many messages per feed. Set to 0 to disable.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(usize))]
+    progress_every: usize,
 
     /// Delay before reconnecting a failed websocket.
     #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..=300))]
@@ -203,6 +217,10 @@ struct StreamArgs {
     /// Websocket protocol ping interval in seconds. Set to 0 to disable client pings.
     #[arg(long = "heartbeat-secs", default_value_t = DEFAULT_WS_HEARTBEAT_SECS, value_parser = clap::value_parser!(u64).range(0..=300))]
     heartbeat_secs: u64,
+
+    /// Refresh Deribit's active instrument list on the existing websocket. Set to 0 to disable.
+    #[arg(long, default_value_t = DEFAULT_DERIBIT_REFRESH_SECS, value_parser = clap::value_parser!(u64).range(0..=86_400))]
+    deribit_refresh_secs: u64,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -215,6 +233,10 @@ struct BtcArgs {
     #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(i32).range(1..=22))]
     zstd_level: i32,
 
+    /// Close, append, and sync the current Zstd frame after this many raw events.
+    #[arg(long, default_value_t = DEFAULT_ZSTD_FRAME_EVENTS, value_parser = parse_positive_usize)]
+    zstd_frame_events: usize,
+
     /// Stop each feed after this many data messages. Mostly useful for smoke tests.
     #[arg(long)]
     max_messages: Option<usize>,
@@ -227,17 +249,25 @@ struct BtcArgs {
     #[arg(long = "heartbeat-secs", default_value_t = DEFAULT_WS_HEARTBEAT_SECS, value_parser = clap::value_parser!(u64).range(0..=300))]
     heartbeat_secs: u64,
 
-    /// Hibachi websocket URL.
-    #[arg(long, env = "HIBACHI_WS_URL", default_value = DEFAULT_HIBACHI_MARKET_WS_URL)]
-    hibachi_url: String,
-
     /// Deribit websocket URL.
     #[arg(long, env = "DERIBIT_WS_URL", default_value = DEFAULT_DERIBIT_WS_URL)]
     deribit_url: String,
 
+    /// Deribit currency to track.
+    #[arg(long, default_value = "BTC", value_parser = parse_deribit_currency)]
+    deribit_currency: String,
+
+    /// Refresh Deribit's active instrument list on the existing websocket. Set to 0 to disable.
+    #[arg(long, default_value_t = DEFAULT_DERIBIT_REFRESH_SECS, value_parser = clap::value_parser!(u64).range(0..=86_400))]
+    deribit_refresh_secs: u64,
+
     /// Hyperliquid spot market coin to subscribe. Omit to resolve BTC spot as UBTC/USDC.
     #[arg(long)]
     hyperliquid_spot_coin: Option<String>,
+
+    /// Print one progress line after this many messages per feed. Set to 0 to disable.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(usize))]
+    progress_every: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -260,6 +290,14 @@ impl DeribitInstrumentKind {
         match self {
             Self::Future => "future",
             Self::Option => "option",
+        }
+    }
+
+    fn from_deribit_str(value: &str) -> Option<Self> {
+        match value {
+            "future" => Some(Self::Future),
+            "option" => Some(Self::Option),
+            _ => None,
         }
     }
 }
@@ -569,8 +607,9 @@ async fn run_stream_command(args: StreamArgs) -> Result<()> {
 
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("received Ctrl+C; stopping websocket recorders");
+            signal = shutdown_signal() => {
+                let signal_name = signal?;
+                eprintln!("received {signal_name}; stopping websocket recorders");
                 let _ = shutdown_tx.send(true);
                 while let Some(result) = join_set.join_next().await {
                     result.context("stream task panicked")??;
@@ -587,11 +626,33 @@ async fn run_stream_command(args: StreamArgs) -> Result<()> {
     }
 }
 
+#[cfg(unix)]
+async fn shutdown_signal() -> Result<&'static str> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut interrupt = signal(SignalKind::interrupt()).context("failed to listen for SIGINT")?;
+    let mut terminate = signal(SignalKind::terminate()).context("failed to listen for SIGTERM")?;
+    let mut hangup = signal(SignalKind::hangup()).context("failed to listen for SIGHUP")?;
+
+    tokio::select! {
+        _ = interrupt.recv() => Ok("SIGINT"),
+        _ = terminate.recv() => Ok("SIGTERM"),
+        _ = hangup.recv() => Ok("SIGHUP"),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> Result<&'static str> {
+    tokio::signal::ctrl_c()
+        .await
+        .context("failed to listen for Ctrl+C")?;
+    Ok("Ctrl+C")
+}
+
 fn btc_stream_args(args: BtcArgs) -> StreamArgs {
     StreamArgs {
         venues: vec![
             StreamVenue::Bitfinex,
-            StreamVenue::Hibachi,
             StreamVenue::Deribit,
             StreamVenue::Hyperliquid,
         ],
@@ -600,13 +661,17 @@ fn btc_stream_args(args: BtcArgs) -> StreamArgs {
         extended_market: DEFAULT_EXTENDED_MARKET.to_owned(),
         extended_spot_market: DEFAULT_EXTENDED_SPOT_MARKET.to_owned(),
         hibachi_symbol: DEFAULT_HIBACHI_SYMBOL.to_owned(),
-        hibachi_url: args.hibachi_url,
+        hibachi_url: DEFAULT_HIBACHI_MARKET_WS_URL.to_owned(),
         deribit_url: args.deribit_url,
+        deribit_currency: args.deribit_currency,
         deribit_kinds: vec![DeribitInstrumentKind::Future, DeribitInstrumentKind::Option],
         deribit_trades_interval: DEFAULT_DERIBIT_TRADES_INTERVAL.to_owned(),
+        deribit_refresh_secs: args.deribit_refresh_secs,
         hyperliquid_spot_coin: args.hyperliquid_spot_coin,
         zstd_level: args.zstd_level,
+        zstd_frame_events: args.zstd_frame_events,
         max_messages: args.max_messages,
+        progress_every: args.progress_every,
         reconnect_delay_secs: args.reconnect_delay_secs,
         heartbeat_secs: args.heartbeat_secs,
     }
@@ -717,56 +782,69 @@ async fn run_static_feed_once(
         &spec.symbol,
         spec.channel,
         args.zstd_level,
+        args.zstd_frame_events,
     )?;
     let mut heartbeat = HeartbeatState::new(args.heartbeat_secs, spec.heartbeat_policy);
 
-    let status = loop {
-        match next_websocket_event(
-            &mut socket_read,
-            &mut socket_write,
-            &mut heartbeat,
-            &spec.connection_id,
-            shutdown,
-        )
-        .await?
-        {
-            NextWebsocketEvent::HeartbeatSent => continue,
-            NextWebsocketEvent::Shutdown => break FeedRunStatus::Complete,
-            NextWebsocketEvent::Closed => break FeedRunStatus::Reconnect,
-            NextWebsocketEvent::Message(message) => {
-                let Some(message) = websocket_message_or_reconnect(message, &spec.connection_id)?
-                else {
-                    break FeedRunStatus::Reconnect;
-                };
-                let message_status = handle_websocket_message(
-                    message,
-                    spec,
-                    &mut socket_write,
-                    &mut event_writer,
-                    &mut heartbeat,
-                    total_messages,
-                )
-                .await?;
-                if message_status == FeedMessageStatus::Reconnect {
-                    break FeedRunStatus::Reconnect;
+    let status_result: Result<FeedRunStatus> = async {
+        let status = loop {
+            match next_websocket_event(
+                &mut socket_read,
+                &mut socket_write,
+                &mut heartbeat,
+                &spec.connection_id,
+                shutdown,
+            )
+            .await?
+            {
+                NextWebsocketEvent::HeartbeatSent => continue,
+                NextWebsocketEvent::Shutdown => break FeedRunStatus::Complete,
+                NextWebsocketEvent::Closed => break FeedRunStatus::Reconnect,
+                NextWebsocketEvent::Message(message) => {
+                    let Some(message) =
+                        websocket_message_or_reconnect(message, &spec.connection_id)?
+                    else {
+                        break FeedRunStatus::Reconnect;
+                    };
+                    let message_status = handle_websocket_message(
+                        message,
+                        spec,
+                        &mut socket_write,
+                        &mut event_writer,
+                        &mut heartbeat,
+                        total_messages,
+                        args.progress_every,
+                    )
+                    .await?;
+                    if message_status == FeedMessageStatus::Reconnect {
+                        break FeedRunStatus::Reconnect;
+                    }
                 }
             }
-        }
 
-        if args
-            .max_messages
-            .is_some_and(|max_messages| *total_messages >= max_messages)
-        {
-            eprintln!(
-                "{} reached max message count ({})",
-                spec.connection_id, total_messages
-            );
-            break FeedRunStatus::Complete;
-        }
-    };
+            if args
+                .max_messages
+                .is_some_and(|max_messages| *total_messages >= max_messages)
+            {
+                eprintln!(
+                    "{} reached max message count ({})",
+                    spec.connection_id, total_messages
+                );
+                break FeedRunStatus::Complete;
+            }
+        };
+        Ok(status)
+    }
+    .await;
 
-    event_writer.close()?;
-    Ok(status)
+    finish_feed_run(
+        status_result,
+        event_writer.close(),
+        &format!(
+            "failed to close raw event writer for {}",
+            spec.connection_id
+        ),
+    )
 }
 
 async fn run_deribit_feed_once(
@@ -800,86 +878,147 @@ async fn run_deribit_feed_once(
         .with_context(|| format!("failed to connect {}", spec.url))?;
     let (mut socket_write, mut socket_read) = socket.split();
 
+    initialize_deribit_subscriptions(&mut socket_write, runtime_state, spec, args).await?;
+
+    let mut event_writers = DeribitCompressedEventWriters::create(
+        &args.output_dir,
+        args.zstd_level,
+        args.zstd_frame_events,
+        &args.deribit_currency,
+    );
+    let mut heartbeat = HeartbeatState::new(args.heartbeat_secs, spec.heartbeat_policy);
+    let mut refresh_ticks = deribit_refresh_interval(args.deribit_refresh_secs);
+
+    let status_result: Result<FeedRunStatus> = async {
+        let status = loop {
+            match next_deribit_event(
+                &mut socket_read,
+                &mut socket_write,
+                &mut heartbeat,
+                &spec.connection_id,
+                shutdown,
+                &mut refresh_ticks,
+            )
+            .await?
+            {
+                NextDeribitEvent::RefreshInstruments => {
+                    send_deribit_get_instruments_requests(
+                        &mut socket_write,
+                        runtime_state,
+                        &spec.connection_id,
+                        &args.deribit_kinds,
+                        &args.deribit_currency,
+                    )
+                    .await?;
+                    continue;
+                }
+                NextDeribitEvent::Websocket(NextWebsocketEvent::HeartbeatSent) => continue,
+                NextDeribitEvent::Websocket(NextWebsocketEvent::Shutdown) => {
+                    break FeedRunStatus::Complete;
+                }
+                NextDeribitEvent::Websocket(NextWebsocketEvent::Closed) => {
+                    break FeedRunStatus::Reconnect;
+                }
+                NextDeribitEvent::Websocket(NextWebsocketEvent::Message(message)) => {
+                    let Some(message) =
+                        websocket_message_or_reconnect(message, &spec.connection_id)?
+                    else {
+                        break FeedRunStatus::Reconnect;
+                    };
+                    let mut context = DeribitMessageContext {
+                        spec,
+                        args,
+                        socket_write: &mut socket_write,
+                        event_writers: &mut event_writers,
+                        heartbeat: &mut heartbeat,
+                        total_messages,
+                        runtime_state,
+                    };
+                    let message_status =
+                        handle_deribit_websocket_message(message, &mut context).await?;
+                    if message_status == FeedMessageStatus::Reconnect {
+                        break FeedRunStatus::Reconnect;
+                    }
+                }
+            }
+
+            if args
+                .max_messages
+                .is_some_and(|max_messages| *total_messages >= max_messages)
+            {
+                eprintln!(
+                    "{} reached max message count ({})",
+                    spec.connection_id, total_messages
+                );
+                break FeedRunStatus::Complete;
+            }
+        };
+        Ok(status)
+    }
+    .await;
+
+    finish_feed_run(
+        status_result,
+        event_writers.close(),
+        &format!(
+            "failed to close Deribit raw event writers for {}",
+            spec.connection_id
+        ),
+    )
+}
+
+fn finish_feed_run(
+    status_result: Result<FeedRunStatus>,
+    close_result: Result<()>,
+    close_context: &str,
+) -> Result<FeedRunStatus> {
+    match (status_result, close_result) {
+        (Ok(status), Ok(())) => Ok(status),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(close_error)) => Err(close_error).with_context(|| close_context.to_owned()),
+        (Err(error), Err(close_error)) => Err(error).with_context(|| {
+            format!("{close_context}; additionally failed to finish writer: {close_error:#}")
+        }),
+    }
+}
+
+async fn initialize_deribit_subscriptions<S>(
+    socket_write: &mut S,
+    runtime_state: &mut FeedRuntimeState,
+    spec: &FeedSpec,
+    args: &StreamArgs,
+) -> Result<()>
+where
+    S: Sink<Message, Error = WsError> + Unpin,
+{
     send_deribit_set_heartbeat(
-        &mut socket_write,
+        socket_write,
         runtime_state,
         &spec.connection_id,
         args.heartbeat_secs,
     )
     .await?;
 
-    let mut initial_channels = deribit_lifecycle_channels(&args.deribit_kinds);
-    initial_channels.extend(runtime_state.instruments.iter().flat_map(|instrument| {
+    let mut initial_channels =
+        deribit_lifecycle_channels(&args.deribit_kinds, &args.deribit_currency);
+    initial_channels.extend(runtime_state.instruments.keys().flat_map(|instrument| {
         deribit_instrument_channels(instrument, &args.deribit_trades_interval)
     }));
     send_deribit_subscribe(
-        &mut socket_write,
+        socket_write,
         runtime_state,
         &spec.connection_id,
         initial_channels,
     )
     .await?;
     send_deribit_get_instruments_requests(
-        &mut socket_write,
+        socket_write,
         runtime_state,
         &spec.connection_id,
         &args.deribit_kinds,
+        &args.deribit_currency,
     )
-    .await?;
-
-    let mut event_writers =
-        DeribitCompressedEventWriters::create(&args.output_dir, args.zstd_level);
-    let mut heartbeat = HeartbeatState::new(args.heartbeat_secs, spec.heartbeat_policy);
-
-    let status = loop {
-        match next_websocket_event(
-            &mut socket_read,
-            &mut socket_write,
-            &mut heartbeat,
-            &spec.connection_id,
-            shutdown,
-        )
-        .await?
-        {
-            NextWebsocketEvent::HeartbeatSent => continue,
-            NextWebsocketEvent::Shutdown => break FeedRunStatus::Complete,
-            NextWebsocketEvent::Closed => break FeedRunStatus::Reconnect,
-            NextWebsocketEvent::Message(message) => {
-                let Some(message) = websocket_message_or_reconnect(message, &spec.connection_id)?
-                else {
-                    break FeedRunStatus::Reconnect;
-                };
-                let mut context = DeribitMessageContext {
-                    spec,
-                    args,
-                    socket_write: &mut socket_write,
-                    event_writers: &mut event_writers,
-                    heartbeat: &mut heartbeat,
-                    total_messages,
-                    runtime_state,
-                };
-                let message_status =
-                    handle_deribit_websocket_message(message, &mut context).await?;
-                if message_status == FeedMessageStatus::Reconnect {
-                    break FeedRunStatus::Reconnect;
-                }
-            }
-        }
-
-        if args
-            .max_messages
-            .is_some_and(|max_messages| *total_messages >= max_messages)
-        {
-            eprintln!(
-                "{} reached max message count ({})",
-                spec.connection_id, total_messages
-            );
-            break FeedRunStatus::Complete;
-        }
-    };
-
-    event_writers.close()?;
-    Ok(status)
+    .await
 }
 
 async fn send_deribit_set_heartbeat<S>(
@@ -961,24 +1100,71 @@ where
     Ok(())
 }
 
+async fn send_deribit_unsubscribe<S>(
+    socket_write: &mut S,
+    runtime_state: &mut FeedRuntimeState,
+    connection_id: &str,
+    channels: Vec<String>,
+) -> Result<()>
+where
+    S: Sink<Message, Error = WsError> + Unpin,
+{
+    if channels.is_empty() {
+        return Ok(());
+    }
+
+    let count = channels.len();
+    let chunk_count = channels.chunks(DERIBIT_SUBSCRIBE_CHUNK_SIZE).len();
+    for (index, channel_chunk) in channels.chunks(DERIBIT_SUBSCRIBE_CHUNK_SIZE).enumerate() {
+        let id = runtime_state.next_deribit_request_id();
+        let text = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "public/unsubscribe",
+            "id": id,
+            "params": {
+                "channels": channel_chunk,
+            }
+        })
+        .to_string();
+
+        socket_write
+            .send(Message::Text(text.into()))
+            .await
+            .with_context(|| format!("failed to send Deribit unsubscribe on {connection_id}"))?;
+        socket_write
+            .flush()
+            .await
+            .with_context(|| format!("failed to flush Deribit unsubscribe on {connection_id}"))?;
+
+        if index + 1 < chunk_count {
+            sleep(DERIBIT_SUBSCRIBE_CHUNK_DELAY).await;
+        }
+    }
+    eprintln!(
+        "{connection_id} unsubscribed from {count} Deribit channel(s) in {chunk_count} request(s)"
+    );
+    Ok(())
+}
+
 async fn send_deribit_get_instruments_requests<S>(
     socket_write: &mut S,
     runtime_state: &mut FeedRuntimeState,
     connection_id: &str,
     kinds: &[DeribitInstrumentKind],
+    currency: &str,
 ) -> Result<()>
 where
     S: Sink<Message, Error = WsError> + Unpin,
 {
     for (index, kind) in kinds.iter().copied().enumerate() {
         let id = runtime_state.next_deribit_request_id();
-        runtime_state.get_instruments_request_ids.insert(id);
+        runtime_state.get_instruments_request_ids.insert(id, kind);
         let text = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "public/get_instruments",
             "id": id,
             "params": {
-                "currency": "BTC",
+                "currency": currency,
                 "kind": kind.as_str(),
                 "expired": false,
             }
@@ -992,7 +1178,7 @@ where
                 format!("failed to send Deribit get_instruments request on {connection_id}")
             })?;
         eprintln!(
-            "{connection_id} requested current BTC {} instruments",
+            "{connection_id} requested current {currency} {} instruments",
             kind.as_str()
         );
 
@@ -1053,59 +1239,82 @@ async fn run_hyperliquid_spot_feed_once(
         "hyperliquid-{} subscribed to trades and l2Book for {}",
         target.output_symbol, target.subscription_coin
     );
+    let progress_connection_id = format!("hyperliquid-{}", target.output_symbol);
 
     let mut event_writers = HyperliquidCompressedEventWriters::create(
         &args.output_dir,
         &target.output_symbol,
         args.zstd_level,
+        args.zstd_frame_events,
     );
 
-    loop {
-        tokio::select! {
-            result = shutdown.changed() => {
-                let shutdown_event = shutdown_event(result.is_err(), shutdown);
-                if matches!(shutdown_event, NextWebsocketEvent::Shutdown) {
-                    break;
+    let status_result: Result<FeedRunStatus> = async {
+        let status = loop {
+            tokio::select! {
+                result = shutdown.changed() => {
+                    let shutdown_event = shutdown_event(result.is_err(), shutdown);
+                    if matches!(shutdown_event, NextWebsocketEvent::Shutdown) {
+                        break FeedRunStatus::Complete;
+                    }
                 }
-            }
-            event = ws.next() => {
-                let Some(event) = event else {
-                    break;
-                };
-                handle_hyperliquid_event(event, &mut event_writers)?;
-                *total_messages += 1;
-
-                if args.max_messages.is_some_and(|max_messages| *total_messages >= max_messages) {
-                    eprintln!(
-                        "hyperliquid-{} reached max message count ({})",
-                        target.output_symbol, total_messages
+                event = ws.next() => {
+                    let Some(event) = event else {
+                        break FeedRunStatus::Reconnect;
+                    };
+                    let message_status = handle_hyperliquid_event(event, &mut event_writers)?;
+                    if message_status == FeedMessageStatus::Reconnect {
+                        break FeedRunStatus::Reconnect;
+                    }
+                    *total_messages += 1;
+                    maybe_log_stream_progress(
+                        &progress_connection_id,
+                        *total_messages,
+                        args.progress_every,
                     );
-                    break;
+
+                    if args.max_messages.is_some_and(|max_messages| *total_messages >= max_messages) {
+                        eprintln!(
+                            "hyperliquid-{} reached max message count ({})",
+                            target.output_symbol, total_messages
+                        );
+                        break FeedRunStatus::Complete;
+                    }
                 }
             }
-        }
+        };
+        Ok(status)
     }
+    .await;
 
-    event_writers.close()?;
-    Ok(FeedRunStatus::Complete)
+    finish_feed_run(
+        status_result,
+        event_writers.close(),
+        &format!(
+            "failed to close Hyperliquid raw event writers for {}",
+            target.output_symbol
+        ),
+    )
 }
 
 fn handle_hyperliquid_event(
     event: HyperliquidEvent,
     event_writers: &mut HyperliquidCompressedEventWriters,
-) -> Result<()> {
+) -> Result<FeedMessageStatus> {
     match event {
         HyperliquidEvent::Connected => {
-            event_writers.write_control_event(&serde_json::json!({"event": "connected"}))
+            event_writers.write_control_event(&serde_json::json!({"event": "connected"}))?;
+            Ok(FeedMessageStatus::Continue)
         }
         HyperliquidEvent::Disconnected => {
-            event_writers.write_control_event(&serde_json::json!({"event": "disconnected"}))
+            event_writers.write_control_event(&serde_json::json!({"event": "disconnected"}))?;
+            Ok(FeedMessageStatus::Reconnect)
         }
         HyperliquidEvent::Message(message) => {
             let channel = hyperliquid_output_channel(&message);
             let text = serde_json::to_string(&message)
                 .context("failed to encode Hyperliquid websocket event")?;
-            event_writers.write_text_event(channel, &text)
+            event_writers.write_text_event(channel, &text)?;
+            Ok(FeedMessageStatus::Continue)
         }
     }
 }
@@ -1194,6 +1403,57 @@ where
     }
 }
 
+async fn next_deribit_event<R, S>(
+    socket_read: &mut R,
+    socket_write: &mut S,
+    heartbeat: &mut HeartbeatState,
+    connection_id: &str,
+    shutdown: &mut watch::Receiver<bool>,
+    refresh_ticks: &mut Option<Interval>,
+) -> Result<NextDeribitEvent>
+where
+    R: Stream<Item = Result<Message, WsError>> + Unpin,
+    S: Sink<Message, Error = WsError> + Unpin,
+{
+    if refresh_ticks.is_some() {
+        tokio::select! {
+            event = next_websocket_event(socket_read, socket_write, heartbeat, connection_id, shutdown) => {
+                event.map(NextDeribitEvent::Websocket)
+            }
+            () = deribit_refresh_tick(refresh_ticks) => Ok(NextDeribitEvent::RefreshInstruments),
+        }
+    } else {
+        next_websocket_event(
+            socket_read,
+            socket_write,
+            heartbeat,
+            connection_id,
+            shutdown,
+        )
+        .await
+        .map(NextDeribitEvent::Websocket)
+    }
+}
+
+async fn deribit_refresh_tick(refresh_ticks: &mut Option<Interval>) {
+    if let Some(ticks) = refresh_ticks {
+        ticks.tick().await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+fn deribit_refresh_interval(refresh_secs: u64) -> Option<Interval> {
+    if refresh_secs == 0 {
+        return None;
+    }
+
+    let duration = Duration::from_secs(refresh_secs);
+    let mut ticks = interval_at(Instant::now() + duration, duration);
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    Some(ticks)
+}
+
 fn shutdown_event(shutdown_closed: bool, shutdown: &watch::Receiver<bool>) -> NextWebsocketEvent {
     if !shutdown_closed && !*shutdown.borrow() {
         return NextWebsocketEvent::HeartbeatSent;
@@ -1222,6 +1482,12 @@ fn websocket_message_or_reconnect(
     }
 }
 
+fn maybe_log_stream_progress(connection_id: &str, total_messages: usize, progress_every: usize) {
+    if progress_every > 0 && total_messages % progress_every == 0 {
+        eprintln!("progress {connection_id} messages={total_messages}");
+    }
+}
+
 fn is_expected_websocket_reconnect_error(error: &WsError) -> bool {
     match error {
         WsError::ConnectionClosed
@@ -1243,6 +1509,7 @@ async fn handle_websocket_message<S>(
     event_writer: &mut DailyCompressedEventWriter,
     heartbeat: &mut HeartbeatState,
     total_messages: &mut usize,
+    progress_every: usize,
 ) -> Result<FeedMessageStatus>
 where
     S: Sink<Message, Error = WsError> + Unpin,
@@ -1252,10 +1519,12 @@ where
             let text = text.as_str();
             event_writer.write_text_event(spec, text)?;
             *total_messages += 1;
+            maybe_log_stream_progress(&spec.connection_id, *total_messages, progress_every);
         }
         Message::Binary(bytes) => {
             event_writer.write_binary_event(spec, &bytes)?;
             *total_messages += 1;
+            maybe_log_stream_progress(&spec.connection_id, *total_messages, progress_every);
         }
         Message::Ping(_) => flush_queued_pong(socket_write, &spec.connection_id).await?,
         Message::Pong(payload) => heartbeat.observe_pong(payload.as_ref()),
@@ -1299,6 +1568,7 @@ where
             )
             .await?;
             maybe_subscribe_deribit_get_instruments(text, context).await?;
+            maybe_update_deribit_instrument_state(text, context).await?;
             maybe_subscribe_deribit_created_instrument(
                 text,
                 context.args,
@@ -1308,12 +1578,22 @@ where
             )
             .await?;
             *context.total_messages += 1;
+            maybe_log_stream_progress(
+                &context.spec.connection_id,
+                *context.total_messages,
+                context.args.progress_every,
+            );
         }
         Message::Binary(bytes) => {
             context
                 .event_writers
                 .write_binary_event("control", &bytes)?;
             *context.total_messages += 1;
+            maybe_log_stream_progress(
+                &context.spec.connection_id,
+                *context.total_messages,
+                context.args.progress_every,
+            );
         }
         Message::Ping(_) => {
             flush_queued_pong(context.socket_write, &context.spec.connection_id).await?;
@@ -1366,33 +1646,38 @@ where
     let Some(response_id) = deribit_response_id(&message) else {
         return Ok(());
     };
-    if !context
+    let Some(kind) = context
         .runtime_state
         .get_instruments_request_ids
         .remove(&response_id)
-    {
+    else {
         return Ok(());
-    }
+    };
 
     if let Some(error) = message.get("error") {
         bail!("Deribit get_instruments failed: {error}");
     }
 
-    let instrument_names = deribit_instrument_names_from_get_instruments_response(
-        &message,
-        &context.args.deribit_kinds,
-    );
+    let current_instruments: HashSet<String> =
+        deribit_instrument_names_from_get_instruments_response(
+            &message,
+            &[kind],
+            &context.args.deribit_currency,
+        )
+        .into_iter()
+        .collect();
     let mut channels = Vec::new();
     let mut new_instruments = 0usize;
-    for instrument_name in instrument_names {
+    for instrument_name in &current_instruments {
         if context
             .runtime_state
             .instruments
-            .insert(instrument_name.clone())
+            .insert(instrument_name.clone(), kind)
+            .is_none()
         {
             new_instruments = new_instruments.saturating_add(1);
             channels.extend(deribit_instrument_channels(
-                &instrument_name,
+                instrument_name,
                 &context.args.deribit_trades_interval,
             ));
         }
@@ -1400,14 +1685,40 @@ where
 
     if !channels.is_empty() {
         eprintln!(
-            "{} discovered {new_instruments} current Deribit BTC instrument(s)",
-            context.spec.connection_id
+            "{} discovered {new_instruments} current Deribit {} instrument(s)",
+            context.spec.connection_id, context.args.deribit_currency
         );
         send_deribit_subscribe(
             context.socket_write,
             context.runtime_state,
             &context.spec.connection_id,
             channels,
+        )
+        .await?;
+    }
+
+    let expired_instruments: Vec<String> = context
+        .runtime_state
+        .instruments
+        .iter()
+        .filter(|(_, instrument_kind)| **instrument_kind == kind)
+        .filter(|(instrument_name, _)| !current_instruments.contains(*instrument_name))
+        .map(|(instrument_name, _)| instrument_name.clone())
+        .collect();
+    let mut expired_channels = Vec::new();
+    for instrument_name in expired_instruments {
+        context.runtime_state.instruments.remove(&instrument_name);
+        expired_channels.extend(deribit_instrument_channels(
+            &instrument_name,
+            &context.args.deribit_trades_interval,
+        ));
+    }
+    if !expired_channels.is_empty() {
+        send_deribit_unsubscribe(
+            context.socket_write,
+            context.runtime_state,
+            &context.spec.connection_id,
+            expired_channels,
         )
         .await?;
     }
@@ -1452,6 +1763,65 @@ fn deribit_response_id(message: &Value) -> Option<u64> {
     message.get("id").and_then(Value::as_u64)
 }
 
+async fn maybe_update_deribit_instrument_state<S>(
+    text: &str,
+    context: &mut DeribitMessageContext<'_, S>,
+) -> Result<()>
+where
+    S: Sink<Message, Error = WsError> + Unpin,
+{
+    let Ok(message) = serde_json::from_str::<Value>(text) else {
+        return Ok(());
+    };
+    let Some(update) = deribit_instrument_state_update(
+        &message,
+        &context.args.deribit_kinds,
+        &context.args.deribit_currency,
+    ) else {
+        return Ok(());
+    };
+
+    if update.active {
+        if context
+            .runtime_state
+            .instruments
+            .insert(update.instrument_name.clone(), update.kind)
+            .is_none()
+        {
+            let channels = deribit_instrument_channels(
+                &update.instrument_name,
+                &context.args.deribit_trades_interval,
+            );
+            send_deribit_subscribe(
+                context.socket_write,
+                context.runtime_state,
+                &context.spec.connection_id,
+                channels,
+            )
+            .await?;
+        }
+    } else if context
+        .runtime_state
+        .instruments
+        .remove(&update.instrument_name)
+        .is_some()
+    {
+        let channels = deribit_instrument_channels(
+            &update.instrument_name,
+            &context.args.deribit_trades_interval,
+        );
+        send_deribit_unsubscribe(
+            context.socket_write,
+            context.runtime_state,
+            &context.spec.connection_id,
+            channels,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
 async fn maybe_subscribe_deribit_created_instrument<S>(
     text: &str,
     args: &StreamArgs,
@@ -1465,53 +1835,136 @@ where
     let Ok(message) = serde_json::from_str::<Value>(text) else {
         return Ok(());
     };
-    let Some(instrument_name) = deribit_created_instrument_name(&message, &args.deribit_kinds)
+    let Some(created) =
+        deribit_created_instrument_name(&message, &args.deribit_kinds, &args.deribit_currency)
     else {
         return Ok(());
     };
 
-    if runtime_state.instruments.insert(instrument_name.clone()) {
-        let channels = deribit_instrument_channels(&instrument_name, &args.deribit_trades_interval);
+    if runtime_state
+        .instruments
+        .insert(created.instrument_name.clone(), created.kind)
+        .is_none()
+    {
+        let channels =
+            deribit_instrument_channels(&created.instrument_name, &args.deribit_trades_interval);
         send_deribit_subscribe(socket_write, runtime_state, connection_id, channels).await?;
     }
     Ok(())
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct DeribitCreatedInstrument {
+    instrument_name: String,
+    kind: DeribitInstrumentKind,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct DeribitInstrumentStateUpdate {
+    instrument_name: String,
+    kind: DeribitInstrumentKind,
+    active: bool,
+}
+
 fn deribit_created_instrument_name(
     message: &Value,
     allowed_kinds: &[DeribitInstrumentKind],
-) -> Option<String> {
+    currency: &str,
+) -> Option<DeribitCreatedInstrument> {
     let channel = deribit_message_channel(message)?;
-    if !channel.starts_with("instrument.creation.") {
+    let (kind, channel_currency) = deribit_lifecycle_channel_parts(channel, "creation")?;
+    if channel_currency != currency || !allowed_kinds.contains(&kind) {
         return None;
     }
 
     let data = deribit_message_data(message)?;
+    if !deribit_state_message_is_active(data) {
+        return None;
+    }
+
     if data
         .get("base_currency")
         .and_then(Value::as_str)
-        .is_some_and(|currency| currency != "BTC")
+        .is_some_and(|base_currency| base_currency != currency)
     {
         return None;
     }
 
-    if let Some(kind) = data.get("kind").and_then(Value::as_str) {
-        let allowed = allowed_kinds
-            .iter()
-            .any(|allowed_kind| allowed_kind.as_str() == kind);
-        if !allowed {
+    if let Some(data_kind) = data
+        .get("kind")
+        .and_then(Value::as_str)
+        .and_then(DeribitInstrumentKind::from_deribit_str)
+    {
+        if data_kind != kind {
             return None;
         }
     }
 
     data.get("instrument_name")
         .and_then(Value::as_str)
-        .map(str::to_owned)
+        .map(|instrument_name| DeribitCreatedInstrument {
+            instrument_name: instrument_name.to_owned(),
+            kind,
+        })
+}
+
+fn deribit_instrument_state_update(
+    message: &Value,
+    allowed_kinds: &[DeribitInstrumentKind],
+    currency: &str,
+) -> Option<DeribitInstrumentStateUpdate> {
+    let channel = deribit_message_channel(message)?;
+    let (kind, channel_currency) = deribit_lifecycle_channel_parts(channel, "state")?;
+    if channel_currency != currency || !allowed_kinds.contains(&kind) {
+        return None;
+    }
+
+    let data = deribit_message_data(message)?;
+    let instrument_name = data.get("instrument_name").and_then(Value::as_str)?;
+    Some(DeribitInstrumentStateUpdate {
+        instrument_name: instrument_name.to_owned(),
+        kind,
+        active: deribit_state_message_is_active(data),
+    })
+}
+
+fn deribit_lifecycle_channel_parts<'a>(
+    channel: &'a str,
+    event: &str,
+) -> Option<(DeribitInstrumentKind, &'a str)> {
+    let mut parts = channel.split('.');
+    if parts.next()? != "instrument" || parts.next()? != event {
+        return None;
+    }
+    let kind = DeribitInstrumentKind::from_deribit_str(parts.next()?)?;
+    let currency = parts.next()?;
+    parts.next().is_none().then_some((kind, currency))
+}
+
+fn deribit_state_message_is_active(data: &Value) -> bool {
+    if data
+        .get("is_active")
+        .and_then(Value::as_bool)
+        .is_some_and(|is_active| !is_active)
+    {
+        return false;
+    }
+
+    !data
+        .get("state")
+        .and_then(Value::as_str)
+        .is_some_and(|state| {
+            matches!(
+                state.to_ascii_lowercase().as_str(),
+                "closed" | "expired" | "inactive" | "settled"
+            )
+        })
 }
 
 fn deribit_instrument_names_from_get_instruments_response(
     message: &Value,
     allowed_kinds: &[DeribitInstrumentKind],
+    currency: &str,
 ) -> Vec<String> {
     let Some(instruments) = message.get("result").and_then(Value::as_array) else {
         return Vec::new();
@@ -1528,15 +1981,15 @@ fn deribit_instrument_names_from_get_instruments_response(
                 return None;
             }
 
-            let is_btc = instrument
+            let is_target_currency = instrument
                 .get("base_currency")
                 .and_then(Value::as_str)
-                .is_some_and(|currency| currency == "BTC")
+                .is_some_and(|base_currency| base_currency == currency)
                 || instrument
                     .get("product_group")
                     .and_then(Value::as_str)
-                    .is_some_and(|product_group| product_group == "BTC");
-            if !is_btc {
+                    .is_some_and(|product_group| product_group == currency);
+            if !is_target_currency {
                 return None;
             }
 
@@ -1579,13 +2032,13 @@ fn deribit_message_channel(message: &Value) -> Option<&str> {
     message.pointer("/params/channel").and_then(Value::as_str)
 }
 
-fn deribit_lifecycle_channels(kinds: &[DeribitInstrumentKind]) -> Vec<String> {
+fn deribit_lifecycle_channels(kinds: &[DeribitInstrumentKind], currency: &str) -> Vec<String> {
     kinds
         .iter()
         .flat_map(|kind| {
             [
-                format!("instrument.creation.{}.BTC", kind.as_str()),
-                format!("instrument.state.{}.BTC", kind.as_str()),
+                format!("instrument.creation.{}.{}", kind.as_str(), currency),
+                format!("instrument.state.{}.{}", kind.as_str(), currency),
             ]
         })
         .collect()
@@ -1700,6 +2153,12 @@ enum NextWebsocketEvent {
     Closed,
 }
 
+#[derive(Debug)]
+enum NextDeribitEvent {
+    Websocket(NextWebsocketEvent),
+    RefreshInstruments,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum FeedMessageStatus {
     Continue,
@@ -1714,8 +2173,8 @@ enum FeedRunStatus {
 
 #[derive(Default)]
 struct FeedRuntimeState {
-    instruments: HashSet<String>,
-    get_instruments_request_ids: HashSet<u64>,
+    instruments: HashMap<String, DeribitInstrumentKind>,
+    get_instruments_request_ids: HashMap<u64, DeribitInstrumentKind>,
     request_id: u64,
 }
 
@@ -1897,11 +2356,12 @@ fn hibachi_stream_spec(args: &StreamArgs) -> FeedSpec {
 }
 
 fn deribit_stream_spec(args: &StreamArgs) -> FeedSpec {
+    let currency = args.deribit_currency.clone();
     FeedSpec {
         exchange: "deribit",
-        symbol: "BTC".to_owned(),
+        symbol: currency.clone(),
         channel: "instrument_lifecycle",
-        connection_id: "deribit-BTC-instruments".to_owned(),
+        connection_id: format!("deribit-{currency}-instruments"),
         url: args.deribit_url.clone(),
         subscribe_messages: Vec::new(),
         behavior: FeedBehavior::DeribitInstrumentDiscovery,
@@ -1941,6 +2401,9 @@ fn validate_stream_args(args: &StreamArgs) -> Result<()> {
     if args.deribit_url.is_empty() {
         bail!("deribit URL cannot be empty");
     }
+    if args.deribit_currency.is_empty() {
+        bail!("deribit currency cannot be empty");
+    }
     if args.deribit_kinds.is_empty() {
         bail!("at least one --deribit-kind is required");
     }
@@ -1964,11 +2427,24 @@ fn parse_deribit_trades_interval(value: &str) -> Result<String, String> {
     }
 }
 
+fn parse_deribit_currency(value: &str) -> Result<String, String> {
+    let currency = value.trim().to_ascii_uppercase();
+    if currency.is_empty() {
+        return Err("Deribit currency cannot be empty".to_owned());
+    }
+    if !currency.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+        return Err("Deribit currency must contain only ASCII letters or numbers".to_owned());
+    }
+    Ok(currency)
+}
+
 struct DailyCompressedEventWriter {
     partition_dir: PathBuf,
     symbol_name: String,
     channel_name: String,
     zstd_level: i32,
+    frame_events: usize,
+    current_frame_events: usize,
     current_date: Option<NaiveDate>,
     current_writer: Option<zstd::stream::write::Encoder<'static, BufWriter<File>>>,
 }
@@ -1980,7 +2456,12 @@ impl DailyCompressedEventWriter {
         symbol: &str,
         channel: &str,
         zstd_level: i32,
+        frame_events: usize,
     ) -> Result<Self> {
+        if frame_events == 0 {
+            bail!("zstd frame event limit must be greater than zero");
+        }
+
         let exchange_name = symbol_partition_name(exchange)?;
         let symbol_name = symbol_partition_name(symbol)?;
         let channel_name = symbol_partition_name(channel)?;
@@ -1996,6 +2477,8 @@ impl DailyCompressedEventWriter {
             symbol_name,
             channel_name,
             zstd_level,
+            frame_events,
+            current_frame_events: 0,
             current_date: None,
             current_writer: None,
         })
@@ -2054,6 +2537,7 @@ impl DailyCompressedEventWriter {
                 })?,
             );
             self.current_date = Some(date);
+            self.current_frame_events = 0;
         }
 
         let writer = self
@@ -2065,13 +2549,23 @@ impl DailyCompressedEventWriter {
         writer
             .write_all(b"\n")
             .context("failed to write raw websocket newline")?;
+        self.current_frame_events = self.current_frame_events.saturating_add(1);
+        if self.current_frame_events >= self.frame_events {
+            self.close_current_writer()?;
+        }
         Ok(())
     }
 
     fn close_current_writer(&mut self) -> Result<()> {
         if let Some(writer) = self.current_writer.take() {
-            writer.finish().context("failed to finish zstd stream")?;
+            let mut writer = writer.finish().context("failed to finish zstd stream")?;
+            writer.flush().context("failed to flush zstd file")?;
+            writer
+                .get_ref()
+                .sync_data()
+                .context("failed to sync zstd file")?;
             self.current_date = None;
+            self.current_frame_events = 0;
         }
         Ok(())
     }
@@ -2083,28 +2577,32 @@ impl DailyCompressedEventWriter {
 
 struct DeribitCompressedEventWriters {
     output_dir: PathBuf,
+    currency: String,
     zstd_level: i32,
+    frame_events: usize,
     writers: HashMap<&'static str, DailyCompressedEventWriter>,
 }
 
 impl DeribitCompressedEventWriters {
-    fn create(output_dir: &Path, zstd_level: i32) -> Self {
+    fn create(output_dir: &Path, zstd_level: i32, frame_events: usize, currency: &str) -> Self {
         Self {
             output_dir: output_dir.to_path_buf(),
+            currency: currency.to_owned(),
             zstd_level,
+            frame_events,
             writers: HashMap::new(),
         }
     }
 
     fn write_text_event(&mut self, channel: &'static str, text: &str) -> Result<()> {
-        let spec = deribit_output_spec(channel);
+        let spec = deribit_output_spec(&self.currency, channel);
         self.writer(channel)?
             .write_text_event(&spec, text)
             .with_context(|| format!("failed to write Deribit {channel} text event"))
     }
 
     fn write_binary_event(&mut self, channel: &'static str, bytes: &[u8]) -> Result<()> {
-        let spec = deribit_output_spec(channel);
+        let spec = deribit_output_spec(&self.currency, channel);
         self.writer(channel)?
             .write_binary_event(&spec, bytes)
             .with_context(|| format!("failed to write Deribit {channel} binary event"))
@@ -2115,9 +2613,10 @@ impl DeribitCompressedEventWriters {
             let writer = DailyCompressedEventWriter::create(
                 &self.output_dir,
                 "deribit",
-                "BTC",
+                &self.currency,
                 channel,
                 self.zstd_level,
+                self.frame_events,
             )?;
             self.writers.insert(channel, writer);
         }
@@ -2135,12 +2634,12 @@ impl DeribitCompressedEventWriters {
     }
 }
 
-fn deribit_output_spec(channel: &'static str) -> FeedSpec {
+fn deribit_output_spec(currency: &str, channel: &'static str) -> FeedSpec {
     FeedSpec {
         exchange: "deribit",
-        symbol: "BTC".to_owned(),
+        symbol: currency.to_owned(),
         channel,
-        connection_id: "deribit-BTC-instruments".to_owned(),
+        connection_id: format!("deribit-{currency}-instruments"),
         url: String::new(),
         subscribe_messages: Vec::new(),
         behavior: FeedBehavior::Static,
@@ -2157,15 +2656,17 @@ struct HyperliquidCompressedEventWriters {
     output_dir: PathBuf,
     symbol: String,
     zstd_level: i32,
+    frame_events: usize,
     writers: HashMap<&'static str, DailyCompressedEventWriter>,
 }
 
 impl HyperliquidCompressedEventWriters {
-    fn create(output_dir: &Path, symbol: &str, zstd_level: i32) -> Self {
+    fn create(output_dir: &Path, symbol: &str, zstd_level: i32, frame_events: usize) -> Self {
         Self {
             output_dir: output_dir.to_path_buf(),
             symbol: symbol.to_owned(),
             zstd_level,
+            frame_events,
             writers: HashMap::new(),
         }
     }
@@ -2191,6 +2692,7 @@ impl HyperliquidCompressedEventWriters {
                 &self.symbol,
                 channel,
                 self.zstd_level,
+                self.frame_events,
             )?;
             self.writers.insert(channel, writer);
         }
@@ -3032,15 +3534,21 @@ mod tests {
             hibachi_symbol: DEFAULT_HIBACHI_SYMBOL.to_owned(),
             hibachi_url: DEFAULT_HIBACHI_MARKET_WS_URL.to_owned(),
             deribit_url: DEFAULT_DERIBIT_WS_URL.to_owned(),
+            deribit_currency: "ETH".to_owned(),
             deribit_kinds: vec![DeribitInstrumentKind::Future, DeribitInstrumentKind::Option],
             deribit_trades_interval: DEFAULT_DERIBIT_TRADES_INTERVAL.to_owned(),
+            deribit_refresh_secs: DEFAULT_DERIBIT_REFRESH_SECS,
             hyperliquid_spot_coin: None,
             zstd_level: 6,
+            zstd_frame_events: DEFAULT_ZSTD_FRAME_EVENTS,
             max_messages: None,
+            progress_every: 0,
             reconnect_delay_secs: 5,
             heartbeat_secs: DEFAULT_WS_HEARTBEAT_SECS,
         });
         assert_eq!(deribit.exchange, "deribit");
+        assert_eq!(deribit.symbol, "ETH");
+        assert_eq!(deribit.connection_id, "deribit-ETH-instruments");
         assert_eq!(deribit.heartbeat_policy, HeartbeatPolicy::BestEffort);
 
         let hyperliquid = hyperliquid_stream_spec();
@@ -3098,41 +3606,43 @@ mod tests {
         let args = btc_stream_args(BtcArgs {
             output_dir: PathBuf::from("/tmp/modl-btc"),
             zstd_level: 6,
+            zstd_frame_events: DEFAULT_ZSTD_FRAME_EVENTS,
             max_messages: Some(1),
             reconnect_delay_secs: 5,
             heartbeat_secs: DEFAULT_WS_HEARTBEAT_SECS,
-            hibachi_url: DEFAULT_HIBACHI_MARKET_WS_URL.to_owned(),
             deribit_url: DEFAULT_DERIBIT_WS_URL.to_owned(),
+            deribit_currency: "BTC".to_owned(),
+            deribit_refresh_secs: DEFAULT_DERIBIT_REFRESH_SECS,
             hyperliquid_spot_coin: None,
+            progress_every: 0,
         });
 
         assert_eq!(
             args.venues,
             vec![
                 StreamVenue::Bitfinex,
-                StreamVenue::Hibachi,
                 StreamVenue::Deribit,
                 StreamVenue::Hyperliquid,
             ]
         );
         assert_eq!(args.output_dir, PathBuf::from("/tmp/modl-btc"));
         assert_eq!(args.extended_spot_market, DEFAULT_EXTENDED_SPOT_MARKET);
-        assert_eq!(stream_specs(&args).len(), 5);
+        assert_eq!(stream_specs(&args).len(), 4);
     }
 
     #[test]
     fn builds_deribit_subscription_channels() {
-        let channels = deribit_lifecycle_channels(&[
-            DeribitInstrumentKind::Future,
-            DeribitInstrumentKind::Option,
-        ]);
+        let channels = deribit_lifecycle_channels(
+            &[DeribitInstrumentKind::Future, DeribitInstrumentKind::Option],
+            "ETH",
+        );
         assert_eq!(
             channels,
             vec![
-                "instrument.creation.future.BTC",
-                "instrument.state.future.BTC",
-                "instrument.creation.option.BTC",
-                "instrument.state.option.BTC",
+                "instrument.creation.future.ETH",
+                "instrument.state.future.ETH",
+                "instrument.creation.option.ETH",
+                "instrument.state.option.ETH",
             ]
         );
 
@@ -3193,8 +3703,11 @@ mod tests {
             }
         });
         assert_eq!(
-            deribit_created_instrument_name(&message, &allowed).as_deref(),
-            Some("BTC-13JAN23-16000-P")
+            deribit_created_instrument_name(&message, &allowed, "BTC"),
+            Some(DeribitCreatedInstrument {
+                instrument_name: "BTC-13JAN23-16000-P".to_owned(),
+                kind: DeribitInstrumentKind::Option,
+            })
         );
 
         let eth_message = serde_json::json!({
@@ -3208,7 +3721,49 @@ mod tests {
             }
         });
         assert_eq!(
-            deribit_created_instrument_name(&eth_message, &allowed),
+            deribit_created_instrument_name(&eth_message, &allowed, "BTC"),
+            None
+        );
+        assert_eq!(
+            deribit_created_instrument_name(&eth_message, &allowed, "ETH"),
+            Some(DeribitCreatedInstrument {
+                instrument_name: "ETH-13JAN23-16000-P".to_owned(),
+                kind: DeribitInstrumentKind::Option,
+            })
+        );
+
+        let inactive = serde_json::json!({
+            "params": {
+                "channel": "instrument.state.future.BTC",
+                "data": {
+                    "state": "inactive",
+                    "instrument_name": "BTC-27JUL26"
+                }
+            }
+        });
+        assert_eq!(
+            deribit_instrument_state_update(&inactive, &allowed, "BTC"),
+            Some(DeribitInstrumentStateUpdate {
+                instrument_name: "BTC-27JUL26".to_owned(),
+                kind: DeribitInstrumentKind::Future,
+                active: false,
+            })
+        );
+
+        let inactive_creation = serde_json::json!({
+            "params": {
+                "channel": "instrument.creation.option.BTC",
+                "data": {
+                    "kind": "option",
+                    "base_currency": "BTC",
+                    "state": "inactive",
+                    "is_active": false,
+                    "instrument_name": "BTC-7AUG26-72000-C"
+                }
+            }
+        });
+        assert_eq!(
+            deribit_created_instrument_name(&inactive_creation, &allowed, "BTC"),
             None
         );
     }
@@ -3254,8 +3809,12 @@ mod tests {
         });
 
         assert_eq!(
-            deribit_instrument_names_from_get_instruments_response(&message, &allowed),
+            deribit_instrument_names_from_get_instruments_response(&message, &allowed, "BTC"),
             vec!["BTC-PERPETUAL", "BTC-13JAN23-16000-P"]
+        );
+        assert_eq!(
+            deribit_instrument_names_from_get_instruments_response(&message, &allowed, "ETH"),
+            vec!["ETH-13JAN23-16000-P"]
         );
         assert_eq!(deribit_response_id(&message), Some(2));
     }
@@ -3371,13 +3930,26 @@ mod tests {
             heartbeat_policy: HeartbeatPolicy::Required,
         };
 
-        let mut writer =
-            DailyCompressedEventWriter::create(&dir, spec.exchange, &spec.symbol, spec.channel, 1)?;
+        let mut writer = DailyCompressedEventWriter::create(
+            &dir,
+            spec.exchange,
+            &spec.symbol,
+            spec.channel,
+            1,
+            1,
+        )?;
         writer.write_text_event(&spec, r#"{"event":"test"}"#)?;
+        writer.write_text_event(&spec, r#"{"event":"rotated"}"#)?;
         writer.close()?;
 
-        let mut writer =
-            DailyCompressedEventWriter::create(&dir, spec.exchange, &spec.symbol, spec.channel, 1)?;
+        let mut writer = DailyCompressedEventWriter::create(
+            &dir,
+            spec.exchange,
+            &spec.symbol,
+            spec.channel,
+            1,
+            1,
+        )?;
         writer.write_text_event(&spec, r#"{"event":"second"}"#)?;
         writer.close()?;
 
@@ -3391,6 +3963,7 @@ mod tests {
         let text = String::from_utf8(decoded).context("event file was not UTF-8")?;
         assert!(text.contains(r#""exchange":"bitfinex""#));
         assert!(text.contains(r#""payload_text":"{\"event\":\"test\"}""#));
+        assert!(text.contains(r#""payload_text":"{\"event\":\"rotated\"}""#));
         assert!(text.contains(r#""payload_text":"{\"event\":\"second\"}""#));
 
         std::fs::remove_dir_all(dir)?;
